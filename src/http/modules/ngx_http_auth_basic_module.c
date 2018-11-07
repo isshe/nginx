@@ -22,6 +22,7 @@ typedef struct {
 typedef struct {
     ngx_http_complex_value_t  *realm;
     ngx_http_complex_value_t   user_file;
+    ngx_str_t anonymous_user_name;
 } ngx_http_auth_basic_loc_conf_t;
 
 
@@ -55,6 +56,13 @@ static ngx_command_t  ngx_http_auth_basic_commands[] = {
       ngx_http_auth_basic_user_file,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_auth_basic_loc_conf_t, user_file),
+      NULL },
+
+    { ngx_string("auth_basic_anonymous_user_name"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF |NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_auth_basic_loc_conf_t, anonymous_user_name),
       NULL },
 
       ngx_null_command
@@ -149,6 +157,14 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
 
     if (ngx_http_complex_value(r, &alcf->user_file, &user_file) != NGX_OK) {
         return NGX_ERROR;
+    }
+
+    // 判断是否是匿名用户
+    if (r->headers_in.user.len == alcf->anonymous_user_name.len &&
+        ngx_strncmp(r->headers_in.user.data, alcf->anonymous_user_name.data, r->headers_in.user.len) == 0)
+    {
+		ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "auth_basic: is anonymous user");
+        return NGX_OK;
     }
 
     fd = ngx_open_file(user_file.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
@@ -396,6 +412,9 @@ ngx_http_auth_basic_create_loc_conf(ngx_conf_t *cf)
         return NULL;
     }
 
+    conf->anonymous_user_name.len = 0;
+    conf->anonymous_user_name.data = NULL;
+
     return conf;
 }
 
@@ -412,6 +431,11 @@ ngx_http_auth_basic_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->user_file.value.data == NULL) {
         conf->user_file = prev->user_file;
+    }
+
+    if (conf->anonymous_user_name.len == 0 || conf->anonymous_user_name.data == NULL)
+    {
+        conf->anonymous_user_name = prev->anonymous_user_name;
     }
 
     return NGX_CONF_OK;

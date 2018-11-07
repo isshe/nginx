@@ -9,32 +9,44 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-
-#define NGX_HTTP_DAV_OFF             2
-
+//#define NGX_HTTP_DAV_OFF             2
 
 #define NGX_HTTP_DAV_NO_DEPTH        -3
 #define NGX_HTTP_DAV_INVALID_DEPTH   -2
 #define NGX_HTTP_DAV_INFINITY_DEPTH  -1
-
+#define NGX_HTTP_MULTI_STATUS        207
+#define NGX_HTTP_DAV_ERROR_CODE_LEN  3
+#define NGX_HTTP_DAV_ERROR_CODE_MIN  400
+#define NGX_HTTP_DAV_ERROR_CODE_MAX  999
 
 typedef struct {
-    ngx_uint_t  methods;
+    ngx_uint_t  methods;                    // 允许的方法
     ngx_uint_t  access;
     ngx_uint_t  min_delete_depth;
     ngx_flag_t  create_full_put_path;
+    ngx_str_t   subrequest_uri;             // 子请求的uri，再conf里设置
 } ngx_http_dav_loc_conf_t;
-
 
 typedef struct {
     ngx_str_t   path;
     size_t      len;
 } ngx_http_dav_copy_ctx_t;
 
+// 请求的上下文，每个请求一份
+typedef struct {
+    ngx_str_t sub_req_args;                 // 子请求的参数，如：method=propfind&user=isshe&dst=/files/&Depth=1&data=xxx
+    ngx_int_t status;                       // 子请求返回的json数据里的状态
+    ngx_str_t data;                         // 子请求返回的json数据里的具体数据
+    ngx_str_t src;                          // 想要操作的源文件
+    ngx_str_t dst;                          // 想要操作的目的文件
+} ngx_http_dav_ctx_t;
 
 static ngx_int_t ngx_http_dav_handler(ngx_http_request_t *r);
 
+static ngx_int_t ngx_http_dav_get_head_handler(ngx_http_request_t *r);
+
 static void ngx_http_dav_put_handler(ngx_http_request_t *r);
+static void ngx_http_dav_propfind_subreq_handler(ngx_http_request_t *r);
 
 static ngx_int_t ngx_http_dav_delete_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_delete_path(ngx_http_request_t *r,
@@ -45,6 +57,9 @@ static ngx_int_t ngx_http_dav_noop(ngx_tree_ctx_t *ctx, ngx_str_t *path);
 
 static ngx_int_t ngx_http_dav_mkcol_handler(ngx_http_request_t *r,
     ngx_http_dav_loc_conf_t *dlcf);
+
+static ngx_int_t ngx_http_dav_propfind_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_dav_options_handler(ngx_http_request_t *r);
 
 static ngx_int_t ngx_http_dav_copy_move_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_copy_dir(ngx_tree_ctx_t *ctx, ngx_str_t *path);
@@ -62,44 +77,181 @@ static char *ngx_http_dav_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
 //static ngx_int_t ngx_http_dav_init(ngx_conf_t *cf);
 
-// 子请求结束后的处理方法
+/**
+ * 子请求返回后的处理方法
+ * @param r
+ * @param data
+ * @param rc
+ * @return
+ */
 static ngx_int_t ngx_http_dav_subrequest_post_handler(ngx_http_request_t *r, void *data, ngx_int_t rc);
 
-// 父请求的回调方法
+
+/**
+ * 子请求结束后激活的父请求的回调方法
+ * @param r
+ */
 static void ngx_http_dav_post_handler(ngx_http_request_t *r);
 
-static ngx_int_t ngx_http_dav_subrequest_create(ngx_http_request_t *r, ngx_str_t *sub_uri);
 
-// 获取destination，排除host部分，注意这个函数只是返回一个指针，里面的内容不能改！
+/**
+ * 创建子请求
+ * @param r
+ * @param sub_uri
+ * @param sub_args
+ * @return 处理结果
+ */
+static ngx_int_t ngx_http_dav_subrequest_create(ngx_http_request_t *r,
+                                                ngx_str_t *sub_uri,
+                                                ngx_str_t *sub_args,
+                                                ngx_http_post_subrequest_pt post_handler,
+                                                void *data);
+
+/**
+ * 生成子请求的的参数字符串
+ * @param r
+ * @param method
+ * @param user
+ * @param src
+ * @param dst
+ * @param user_args
+ * @param depth
+ * @param range
+ * @return 生成的字符串
+ */
+static ngx_str_t subrequest_args_generate(ngx_http_request_t *r,
+                                          ngx_str_t *method,
+                                          ngx_str_t *user,
+                                          ngx_str_t *src,
+                                          ngx_str_t *dst,
+                                          ngx_str_t *user_args,
+                                          ngx_table_elt_t *depth,
+                                          ngx_table_elt_t *range);
+
+/**
+ * 用char *生成 ngx_str_t
+ * @param pool
+ * @param str
+ * @return 新分配的字符串
+ */
+static ngx_str_t ngx_str_generator(ngx_pool_t *pool, const char *str);
+
+
+/**
+ * 获取destination，排除host部分，注意这个函数只是返回一个指针，里面的内容不能改！
+ * @param r
+ * @param dest
+ * @return
+ */
 static u_char *ngx_http_dav_destination_get(ngx_http_request_t *r, ngx_table_elt_t *dest);
 
-// 生成子请求的URI
-static ngx_str_t subrequest_uri_generate_by_dst(ngx_http_request_t *r,
-                                                ngx_str_t *prefix,
-                                                ngx_str_t *method,
-                                                ngx_str_t *dst);
+/**
+ * 获取destination，结果存在res_uri,只是指向原请求的destination（不是重新分配内存），
+ * 所以返回的res_uri里面的内容，尽量不要修改
+ * @param r
+ * @param res_uri
+ * @return
+ */
+static ngx_int_t destination_uri_string_get(ngx_http_request_t *r, ngx_str_t *res_uri);
 
-// 生成子请求的URI
-static ngx_str_t subrequest_uri_generate_by_src_dst(ngx_http_request_t *r,
-                                                    ngx_str_t *prefix, ngx_str_t *method,
-                                                    ngx_str_t *src, ngx_str_t *dst);
 
-// 获取destination，结果存在res_uri, 里面的内容不能修改！
-static int destination_uri_string_get(ngx_http_request_t *r, ngx_str_t *res_uri);
-
+/**
+ * 代替官方的处理方式，只处理对应location的请求
+ * @param cf
+ * @param cmd
+ * @param conf
+ * @return
+ */
 static char *ngx_http_dav_deal_with(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
+
+/**
+ * char * 类型复制为 ngx_str_t类型
+ * @param pool
+ * @param src
+ * @param len
+ * @return 新的字符串（新分配内存）
+ */
+static ngx_str_t ngx_str_copy_from_str(ngx_pool_t *pool, const char *src, ngx_int_t len);
+
+/**
+ * 字符串拼接
+ * @param pool
+ * @param str1
+ * @param str2
+ * @param str3
+ * @return 新的字符串（新分配内存）
+ */
+static ngx_str_t ngx_http_dav_string_splice(ngx_pool_t *pool, ngx_str_t *str1, ngx_str_t *str2, ngx_str_t *str3);
+
+/**
+ * 替换uri和destination
+ * @param r
+ * @param resp_ctx
+ * @return ngx_int_t
+ */
+static ngx_int_t ngx_http_dav_replace_uri_dst(ngx_http_request_t *r, ngx_http_dav_ctx_t *resp_ctx);
+
+/**
+ * 更新请求上下文
+ * @param r ：请求
+ * @param status_json
+ * @param data_json
+ * @return 操作结果
+ */
+static ngx_int_t ngx_http_dav_update_context(ngx_http_request_t *r,
+                                             ngx_http_dav_ctx_t *resp_ctx,
+                                             const ngx_json* status_json,
+                                             const ngx_json* data_json);
+
+/**
+ * 读子请求的响应，放到res里面
+ * @param r
+ * @param res
+ * @return 操作结果
+ */
+static ngx_int_t ngx_http_dav_read_subrequest_response(ngx_http_request_t *r, ngx_str_t *res);
+
+/**
+ * 检查返回的响应里面的data字段，如果是相关的错误码，就返回HTTP对应的错误码
+ * @param r
+ * @return 具体错误码 或 NGX_HTTP_OK
+ */
+static ngx_int_t ngx_http_dav_check_error(ngx_http_request_t *r, const char *str, ngx_int_t len);
+
+
+/**
+ * 获取propfind的data，如果请求里面的data有'\n'，就转换为"%0A"
+ * @param r
+ * @param bufs
+ * @return data_str
+ */
+static ngx_str_t ngx_http_dav_propfind_data_get(ngx_http_request_t *r, ngx_chain_t *bufs);
+
+
+/**
+ * 字符串转换为数字，只做最简单的转换
+ * @param str：字符串
+ * @param len：字符串长度
+ * @param ok：转换结果：0失败，1成功
+ * @return 转换好的数字
+ */
+static ngx_int_t ngx_http_dav_atoi(const char *str, ngx_int_t len, ngx_int_t *ok);
+
+
 static ngx_conf_bitmask_t  ngx_http_dav_methods_mask[] = {
-    { ngx_string("off"), NGX_HTTP_DAV_OFF },
+    //{ ngx_string("off"), NGX_HTTP_DAV_OFF },
     { ngx_string("get"), NGX_HTTP_GET},
+    { ngx_string("head"), NGX_HTTP_HEAD},
     { ngx_string("put"), NGX_HTTP_PUT },
     { ngx_string("delete"), NGX_HTTP_DELETE },
     { ngx_string("mkcol"), NGX_HTTP_MKCOL },
     { ngx_string("copy"), NGX_HTTP_COPY },
     { ngx_string("move"), NGX_HTTP_MOVE },
+    { ngx_string("options"), NGX_HTTP_OPTIONS},
+    { ngx_string("propfind"), NGX_HTTP_PROPFIND },
     { ngx_null_string, 0 }
 };
-
 
 static ngx_command_t  ngx_http_dav_commands[] = {
 
@@ -131,12 +283,20 @@ static ngx_command_t  ngx_http_dav_commands[] = {
       offsetof(ngx_http_dav_loc_conf_t, access),
       NULL },
 
-        { ngx_string("dav_deal_with"),
-          NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_NOARGS,
-          ngx_http_dav_deal_with,
-          NGX_HTTP_LOC_CONF_OFFSET,
-          0,
-          NULL },
+    { ngx_string("dav_deal_with"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_NOARGS,
+      ngx_http_dav_deal_with,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("dav_subrequest_uri"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_dav_loc_conf_t, subrequest_uri),
+      NULL },
+
       ngx_null_command
 };
 
@@ -171,9 +331,30 @@ ngx_module_t  ngx_http_dav_module = {
     NGX_MODULE_V1_PADDING
 };
 
-static ngx_int_t ngx_http_dav_get_handler(ngx_http_request_t *r)
+static ngx_str_t
+ngx_str_copy_from_str(ngx_pool_t *pool, const char *src, ngx_int_t len)
 {
-   u_char                    *last, *location;
+    ngx_str_t dst = ngx_null_string;
+    if (!pool || !src || len <= 0)
+    {
+        return dst;
+    }
+
+    dst.data = ngx_palloc(pool, len);
+    if (!dst.data)
+    {
+        return dst;
+    }
+
+    dst.len = len;
+    ngx_memcpy(dst.data, src, dst.len);
+
+    return dst;
+}
+
+static ngx_int_t ngx_http_dav_get_head_handler(ngx_http_request_t *r)
+{
+    u_char                    *last, *location;
     size_t                     root, len;
     ngx_str_t                  path;
     ngx_int_t                  rc;
@@ -184,7 +365,8 @@ static ngx_int_t ngx_http_dav_get_handler(ngx_http_request_t *r)
     ngx_open_file_info_t       of;
     ngx_http_core_loc_conf_t  *clcf;
 
-    if (!(r->method & NGX_HTTP_GET)) {
+
+    if (!(r->method & NGX_HTTP_GET) && !(r->method & NGX_HTTP_HEAD)) {
         return NGX_HTTP_NOT_ALLOWED;
     }
 
@@ -206,8 +388,7 @@ static ngx_int_t ngx_http_dav_get_handler(ngx_http_request_t *r)
 
     path.len = last - path.data;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
-                   "---isshe---: http filename: \"%s\"", path.data);
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "http GET/HEAD filename: \"%s\"", path.data);
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
@@ -267,7 +448,7 @@ static ngx_int_t ngx_http_dav_get_handler(ngx_http_request_t *r)
 
     r->root_tested = !r->error_page;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0, "---isshe---: http static fd: %d", of.fd);
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "http static fd: %d", of.fd);
 
     if (of.is_dir) {
 
@@ -326,18 +507,15 @@ static ngx_int_t ngx_http_dav_get_handler(ngx_http_request_t *r)
     }
 
 #endif
-    /*
     if (r->method == NGX_HTTP_POST) {
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-
-    rc = ngx_http_discard_request_body(r);
+    rc = ngx_http_discard_request_body(r);          // get/head没有请求体，有的话就丢了
 
     if (rc != NGX_OK) {
         return rc;
     }
-    */
 
     log->action = "sending response to client";
 
@@ -373,6 +551,7 @@ static ngx_int_t ngx_http_dav_get_handler(ngx_http_request_t *r)
 
     rc = ngx_http_send_header(r);
 
+    // 这里可以区分head和get请求，head请求的header_only = 1
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
         return rc;
     }
@@ -395,53 +574,280 @@ static ngx_int_t ngx_http_dav_get_handler(ngx_http_request_t *r)
     return ngx_http_output_filter(r, &out);
 }
 
+static ngx_int_t
+ngx_http_dav_replace_uri_dst(ngx_http_request_t *r, ngx_http_dav_ctx_t *resp_ctx)
+{
+
+    switch(r->method)
+    {
+        case NGX_HTTP_OPTIONS:
+        case NGX_HTTP_PROPFIND:
+            break;
+        case NGX_HTTP_GET:
+        case NGX_HTTP_HEAD:
+        case NGX_HTTP_PUT:
+        case NGX_HTTP_DELETE:
+        case NGX_HTTP_MKCOL:
+            if (resp_ctx->dst.len == 0 || resp_ctx->dst.data == NULL)
+            {
+                return NGX_ERROR;
+            }
+            r->uri = resp_ctx->dst;
+            //r->unparsed_uri = r->uri;           //
+            break;
+        case NGX_HTTP_COPY:
+        case NGX_HTTP_MOVE:
+            if (resp_ctx->src.len == 0 || resp_ctx->src.data == NULL
+                || resp_ctx->dst.len == 0 || resp_ctx->dst.data == NULL)
+            {
+                return NGX_ERROR;
+            }
+
+            r->uri = resp_ctx->src;
+            //r->unparsed_uri = r->uri;           //
+            // r->headers_in.destination一定不会为NULL
+            r->headers_in.destination->value = resp_ctx->dst;
+            break;
+    }
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_update_context(ngx_http_request_t *r,
+                            ngx_http_dav_ctx_t *resp_ctx,
+                            const ngx_json* status_json,
+                            const ngx_json* data_json)
+{
+    // 这里的status是公共的，类型也是确定的
+    resp_ctx->status = status_json->int_value;
+
+    const ngx_json *dst_json = ngx_json_get(data_json, "dst");
+    if (dst_json->type == NX_JSON_STRING)
+    {
+        resp_ctx->dst = ngx_str_copy_from_str(r->pool, dst_json->text_value, ngx_strlen(dst_json->text_value));
+        if (resp_ctx->dst.len <= 0 || !resp_ctx->dst.data)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: dst: memory alloc failed");
+            return NGX_ERROR;
+        }
+    }
+
+    const ngx_json *src_json = ngx_json_get(data_json, "src");
+    if (src_json->type == NX_JSON_STRING)
+    {
+        resp_ctx->src = ngx_str_copy_from_str(r->pool, src_json->text_value, ngx_strlen(src_json->text_value));
+        if (resp_ctx->src.len <= 0 || !resp_ctx->src.data)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: src: memory alloc failed");
+            return NGX_ERROR;
+        }
+    }
+
+    // 对uri和dst进行替换
+    if (ngx_http_dav_replace_uri_dst(r, resp_ctx) != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: replace uri and dst failed");
+        return NGX_ERROR;
+    }
+
+    // 如果data是string，就复制到请求上下文
+    if (data_json->type == NX_JSON_STRING)
+    {
+        resp_ctx->data = ngx_str_copy_from_str(r->pool, data_json->text_value, ngx_strlen(data_json->text_value));
+        if (resp_ctx->data.len <= 0 || !resp_ctx->data.data) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "get response context failed");
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_read_subrequest_response(ngx_http_request_t *r, ngx_str_t *res)
+{
+    ngx_buf_t *precv_buf = NULL;
+
+    if (r->upstream)        // 支持代理的方式
+    {
+        precv_buf = &r->upstream->buffer;
+    }
+
+    if (!precv_buf)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: subrequest has no response body");
+        return NGX_ERROR;
+    }
+
+    // 读子请求返回的内容
+    *res = ngx_str_copy_from_str(r->pool, (const char *)precv_buf->pos, precv_buf->last - precv_buf->pos);
+    if (res->len <= 0 || !res->data)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: copy subrequest response failed");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+// 只做最简单的处理
+static ngx_int_t
+ngx_http_dav_atoi(const char *str, ngx_int_t len, ngx_int_t *ok)
+{
+    ngx_int_t res = 0;
+    ngx_int_t i = 0;
+    ngx_int_t cur_bit = 0;
+
+    if (!str || len <= 0)
+    {
+        *ok = 0;
+        return res;
+    }
+
+    *ok = 1;
+    for (i = 0; i < len; i++)
+    {
+        if (str[i] < '0' || str[i] > '9')
+        {
+            *ok = 0;
+            break;
+        }
+
+        cur_bit = str[i] - '0';
+        res = res * 10 + cur_bit;
+    }
+
+    return res;
+}
+
+static ngx_int_t
+ngx_http_dav_check_error(ngx_http_request_t *r, const char *str, ngx_int_t len)
+{
+    if (len <= 0 || !str)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    // data里面的数据长度为3，并且转换为数字为[400-999]就视为后端返回的错误码
+    if (len == NGX_HTTP_DAV_ERROR_CODE_LEN)  // 只检查3的情况
+    {
+        ngx_int_t ok;
+        ngx_int_t error_code = ngx_http_dav_atoi((const char *)str, len, &ok);
+        if (ok && error_code >= NGX_HTTP_DAV_ERROR_CODE_MIN
+            && error_code <= NGX_HTTP_DAV_ERROR_CODE_MAX)
+        {
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                          "dav: get error code from back-end: %d", error_code);
+            return error_code;
+        }
+    }
+
+    return NGX_HTTP_OK;
+}
+
 // 子请求结束后的处理方法
 static ngx_int_t
 ngx_http_dav_subrequest_post_handler(ngx_http_request_t *r, void *data, ngx_int_t rc)
 {
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "-----isshe-----: in ngx_http_dav_subrequest_post_handler----rc = %d\n", rc);
-    /* // 和后端的交互正常以后把这里开了
-    if (rc != NGX_HTTP_OK) {
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: subrequest status = %d", rc);
+
+    // 如果子请求没有信息返回(precv_buf == NULL), 或者子请求出错，就直接返回错误
+    if ((rc != NGX_OK && rc != NGX_HTTP_OK))
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dav: subrequest status error");
         return NGX_OK;
     }
-    */
-
-    // 解析json示例
-
-    char *str = "{\"status\":1,\"data\":{\"src\":\"src\",\"dst\":\"dst\"}}";
-    char *json_str = (char *)ngx_palloc(r->pool, strlen(str) + 1); //(char *)malloc(strlen(str) + 1);
-    ngx_memcpy(json_str, str, strlen(str));
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "%s\n", json_str);
-    //const nx_json* json=nx_json_parse_utf8(json_str);
-    const ngx_json* json=ngx_json_parse(r->pool, json_str, NULL);
-    if (!json) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "json parse failed.");
-        //return 0;
-    }
-    ngx_json_print(NGX_LOG_DEBUG_HTTP, r->connection->log, json);
-    ngx_pfree(r->pool, json_str);
 
     ngx_http_request_t *pr = r->parent;
+    // 备份写事件后改为自定义的写事件
+    ngx_http_event_handler_pt write_event_handler_bk = pr->write_event_handler;
+    pr->headers_out.status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    pr->write_event_handler = ngx_http_dav_post_handler;
+
+    ngx_str_t sub_reply_json = ngx_null_string;
+    if (ngx_http_dav_read_subrequest_response(r, &sub_reply_json) != NGX_OK)
+    {
+        return NGX_OK;
+    }
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: subrequest return: %V", &sub_reply_json);
+
+    // 读完以后，就进行json解析
+    const ngx_json* json=ngx_json_parse(r->pool, (char *)sub_reply_json.data, NULL);
+    if (json->type == NX_JSON_NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: json parse failed.");
+        return NGX_OK;
+    }
+
+    // status是一定有的，如果没有，就是出错了
+    const ngx_json *status_json = ngx_json_get(json, "status");
+    const ngx_json *data_json = ngx_json_get(json, "data");
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: subrequest response body status type = %d", status_json->type);
+
+    if (status_json->type != NX_JSON_INTEGER
+        || status_json->int_value != 0
+        || data_json->type == NX_JSON_NULL)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dav: json info incorrect.");
+        return NGX_OK;
+    }
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: subrequest response body status = %d", status_json->int_value);
+
+    // 这里进行错误判断
+    if (data_json->type == NX_JSON_STRING
+        && (rc = ngx_http_dav_check_error(r, data_json->text_value,
+                ngx_strlen(data_json->text_value))) != NGX_HTTP_OK)
+    {
+        pr->headers_out.status = rc;
+        return NGX_OK;
+    }
+
+    // 保存到context中，供父请求使用
+    // get perent request context
+    ngx_http_dav_ctx_t *resp_ctx = ngx_http_get_module_ctx(pr, ngx_http_dav_module);
+    if (!resp_ctx) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dav: get response context failed");
+        return NGX_ERROR;
+    }
+
+    // 更新请求上下文
+    if (ngx_http_dav_update_context(pr, resp_ctx, status_json, data_json) != NGX_OK)
+    {
+        return NGX_OK;
+    }
 
     switch (pr->method) {
-        /*
+
         case NGX_HTTP_GET:
         {
-            rc = ngx_http_dav_get_handler(pr);
+            //rc = ngx_http_dav_get_head_handler(pr);
             break;
         }
-        */
-
+        case NGX_HTTP_HEAD:
+        {
+            //pr->header_only = 1;
+            //rc = ngx_http_dav_get_head_handler(pr);
+            break;
+        }
         case NGX_HTTP_PUT:
-            if (pr->uri.data[pr->uri.len - 1] == '/') {
+        {
+            if (pr->uri.data[pr->uri.len - 1] == '/')
+            {
                 ngx_log_error(NGX_LOG_ERR, pr->connection->log, 0,
                               "cannot PUT to a collection");
-
-                return NGX_HTTP_CONFLICT;
+                pr->headers_out.status = NGX_HTTP_CONFLICT;
+                return NGX_OK;
             }
-            
-            /*
+
+            /*      // 1.10.2 里面无法使用，高版本就可以
             if (pr->headers_in.content_range) {
                 ngx_log_error(NGX_LOG_ERR, pr->connection->log, 0,
                               "PUT with range is unsupported");
@@ -455,44 +861,52 @@ ngx_http_dav_subrequest_post_handler(ngx_http_request_t *r, void *data, ngx_int_
             pr->request_body_file_group_access = 1;
             pr->request_body_file_log_level = 0;
 
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "-----isshe-----: in ngx_http_dav_post_handler: before ngx_http_read_client_request_body---\n");
+            // 读完body后，调用ngx_http_dav_put_handler
+            pr->write_event_handler = write_event_handler_bk;             // 恢复回调
             rc = ngx_http_read_client_request_body(pr, ngx_http_dav_put_handler);
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "-----isshe-----: in ngx_http_dav_post_handler: behind ngx_http_read_client_request_body---\n");
             if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
                 break;
-                //return rc;
             }
-            pr->headers_out.status = rc;
-            //pr->write_event_handler = ngx_http_dav_post_handler;
+            pr->headers_out.status = NGX_HTTP_OK;
             return NGX_DONE;
-            //rc = NGX_DONE;
-            //break;
-        /*
-        case NGX_HTTP_DELETE:
-        {
-            rc = ngx_http_dav_delete_handler(pr);
-            break;
         }
 
+        case NGX_HTTP_DELETE:
+        {
+            //rc = ngx_http_dav_delete_handler(pr);
+            break;
+        }
         case NGX_HTTP_MKCOL:
-            rc = ngx_http_dav_mkcol_handler(pr, dlcf);
+        {
+            //rc = ngx_http_dav_mkcol_handler(pr, dlcf);
             break;
-
+        }
         case NGX_HTTP_COPY:
-            rc = ngx_http_dav_copy_move_handler(pr);
+        {
+            //rc = ngx_http_dav_copy_move_handler(pr);
             break;
-
+        }
         case NGX_HTTP_MOVE:
-            rc = ngx_http_dav_copy_move_handler(pr);
+        {
+            //rc = ngx_http_dav_copy_move_handler(pr);
             break;
-            */
+        }
+        case NGX_HTTP_OPTIONS:              // options 和 propfind请求都需要复制data
+        case NGX_HTTP_PROPFIND:
+        {
+            // 这里PROPFIND是后台返回的，直接复制转发给用户
+            if (data_json->type != NX_JSON_STRING) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "dav: the data returned by the subrequest is not a string");
+                return NGX_OK;
+            }
+
+            break;
+        }
     }
 
-    pr->headers_out.status = rc;
-    pr->write_event_handler = ngx_http_dav_post_handler;
-    //pr->headers_out = r->headers_out;       // 直接把子请求的响应返回去
+    pr->headers_out.status = NGX_HTTP_OK;
+    // 这里不再设置写事件pr->write_event_handler = ngx_http_dav_post_handler
     return NGX_OK;
 }
 
@@ -501,40 +915,32 @@ static void
 ngx_http_dav_post_handler(ngx_http_request_t *r)
 {
     ngx_int_t rc = r->headers_out.status;
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "-----isshe-----: in ngx_http_dav_post_handler: r->headers_out.status = %d, method = %d----\n", r->headers_out.status, r->method);
-    //r->headers_out.status = NGX_HTTP_NO_CONTENT;
-    //r->header_only = 1;
-    //ngx_int_t ret = ngx_http_send_header(r);
-    //ngx_http_send_header(r);
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "in parent request(method = %d): subrequest status = %d", r->method, rc);
 
-    /*
-    int body_len = 10;
-    ngx_buf_t *buf = ngx_create_temp_buf(r->pool, body_len);
-    ngx_snprintf(buf->pos, body_len, "%s\n", "isshe");
-    buf->last = buf->pos + body_len;
-    buf->last_buf = 1;
-    ngx_chain_t out;
-    out.buf = buf;
-    out.next = NULL;
-    static ngx_str_t type = ngx_string("text/plain; charset=UTF-8");
-    r->headers_out.content_type = type;
-    r->headers_out.status = NGX_HTTP_OK;
-    r->connection->buffered |= NGX_HTTP_WRITE_BUFFERED;
-    */
+    if (r->method != NGX_HTTP_PROPFIND)
+    {
+        r->main->count++;
+    }
 
-    //ngx_http_send_header(r);
-
-    //ngx_http_output_filter(r, &out); //r->request_body->bufs);
-    //ngx_http_finalize_request(r, ret);
-    //ngx_http_finalize_request(r, r->headers_out.status);
+    if (rc != NGX_HTTP_OK && rc != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,"subrequest return an error!");
+        ngx_http_finalize_request(r, rc);
+        return;
+    }
 
     // get 放回父请求，因为子请求无法处理
-
     switch (r->method) {
         case NGX_HTTP_GET:
         {
-            rc = ngx_http_dav_get_handler(r);
+            rc = ngx_http_dav_get_head_handler(r);
+            break;
+        }
+        case NGX_HTTP_HEAD:
+        {
+            r->header_only = 1;
+            rc = ngx_http_dav_get_head_handler(r);
             break;
         }
         case NGX_HTTP_DELETE:
@@ -542,37 +948,45 @@ ngx_http_dav_post_handler(ngx_http_request_t *r)
             rc = ngx_http_dav_delete_handler(r);
             break;
         }
-
         case NGX_HTTP_MKCOL:
         {
             ngx_http_dav_loc_conf_t  *dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
             rc = ngx_http_dav_mkcol_handler(r, dlcf);
             break;
         }
-
         case NGX_HTTP_COPY:
+        {
             rc = ngx_http_dav_copy_move_handler(r);
             break;
-
+        }
         case NGX_HTTP_MOVE:
+        {
             rc = ngx_http_dav_copy_move_handler(r);
             break;
+        }
+        case NGX_HTTP_OPTIONS:
+        {
+            rc = ngx_http_dav_options_handler(r);
+            break;
+        }
+        case NGX_HTTP_PROPFIND:
+        {
+            rc = ngx_http_dav_propfind_handler(r);
+            break;
+        }
     }
-    //if (r->method != NGX_HTTP_PUT){
-    //    ngx_http_send_header(r);
-        ngx_http_finalize_request(r, rc);
-    //}
+
+    ngx_http_finalize_request(r, rc);
 }
 
 static ngx_int_t
-ngx_http_dav_subrequest_create(ngx_http_request_t *r, ngx_str_t *sub_uri)
+ngx_http_dav_subrequest_create(ngx_http_request_t *r, ngx_str_t *sub_uri, ngx_str_t *sub_args,
+                               ngx_http_post_subrequest_pt post_handler, void *data)
 {
     if (!r || !sub_uri || sub_uri->len == 0 || sub_uri->data == NULL) {
         return NGX_DECLINED;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "-----isshe-----: in ngx_http_dav_subrequest_create----\n");
     ngx_http_post_subrequest_t *psr = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
     if (!psr) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -581,60 +995,133 @@ ngx_http_dav_subrequest_create(ngx_http_request_t *r, ngx_str_t *sub_uri)
     // 设置子请求的回调
     psr->handler = ngx_http_dav_subrequest_post_handler;
 
-    //ngx_str_t sub_uri = ngx_string("/index");
+    if (data)
+    {
+        psr->data = data;
+    }
+
     ngx_http_request_t *sr;
 
-    //return ngx_http_subrequest(r, sub_uri, NULL, &sr, psr, 0); // NGX_HTTP_SUBREQUEST_IN_MEMORY);
-    return ngx_http_subrequest(r, sub_uri, NULL, &sr, psr, NGX_HTTP_SUBREQUEST_IN_MEMORY);
+    return ngx_http_subrequest(r, sub_uri, sub_args, &sr, psr, NGX_HTTP_SUBREQUEST_IN_MEMORY);
 }
-
 
 static ngx_str_t
-subrequest_uri_generate_by_dst(ngx_http_request_t *r,
-                                ngx_str_t *prefix,
-                                ngx_str_t *method,
-                                ngx_str_t *dst)
+subrequest_args_generate(ngx_http_request_t *r,
+                         ngx_str_t *method,
+                         ngx_str_t *user,
+                         ngx_str_t *src,
+                         ngx_str_t *dst,
+                         ngx_str_t *user_args,
+                         ngx_table_elt_t *depth,
+                         ngx_table_elt_t *range)
 {
-    ngx_str_t dst_prefix = ngx_string("&dst=");
-    ngx_str_t user_prefix = ngx_string("&user=");
-    ngx_str_t uri;
-    uri.len = prefix->len + method->len + dst_prefix.len
-                + dst->len + user_prefix.len + r->headers_in.user.len;
-    uri.data = ngx_palloc(r->pool, uri.len);    // + 1
-    if (uri.data) {
-        ngx_snprintf(uri.data, uri.len, "%V%V%V%V%V%V", prefix, method,
-                    &user_prefix, &r->headers_in.user, &dst_prefix, dst);
-        //uri.data[uri.len] = '\0';
+
+    ngx_str_t method_prefix = ngx_string("method=");;
+    ngx_str_t user_prefix = ngx_string("user=");;
+    ngx_str_t src_prefix = ngx_string("src=");
+    ngx_str_t dst_prefix = ngx_string("dst=");;
+
+    ngx_str_t args;
+    args.len = method_prefix.len + method->len
+               + user_prefix.len + user->len
+               + dst_prefix.len + dst->len
+               + 2;                                     // 2-> &, &
+
+    ngx_int_t cur_pos = args.len;                       // 固定部分的长度
+
+    if (src && src->len > 0)
+    {
+        args.len += src_prefix.len + src->len + 1;      // 1 -> &
     }
-    return uri;
+
+    if (user_args && user_args->len > 0)
+    {
+        args.len += user_args->len + 1;
+    }
+
+    if (depth)
+    {
+        args.len += depth->key.len + depth->value.len + 2;  // '&xxx=yyy' = nr_x + nr_y + 2
+    }
+
+    if (range)
+    {
+        args.len += range->key.len + range->value.len + 2;  // '&xxx=yyy' = nr_x + nr_y + 2
+    }
+
+    args.data = ngx_palloc(r->pool, args.len);
+    if (!args.data)
+    {
+        args.len = 0;
+        return args;
+    }
+
+    ngx_snprintf(args.data, args.len, "%V%V&%V%V&%V%V",
+                 &method_prefix, method,
+                 &user_prefix, user,
+                 &dst_prefix, dst);
+
+    if (src && src->len > 0)
+    {
+        ngx_snprintf(args.data + cur_pos, args.len - cur_pos, "&%V%V", &src_prefix, src);
+        cur_pos += src_prefix.len + src->len + 1;      // 1 -> &
+    }
+
+    if (user_args && user_args->len > 0) {
+        ngx_snprintf(args.data + cur_pos, args.len - cur_pos, "&%V", user_args);
+        cur_pos += user_args->len + 1;
+    }
+
+    if (depth)
+    {
+        ngx_snprintf(args.data + cur_pos, args.len - cur_pos, "&%V=%V", &depth->key, &depth->value);
+        cur_pos += depth->key.len + depth->value.len + 2;  // '&xxx=yyy' = nr_x + nr_y + 2
+    }
+
+    if (range)
+    {
+        ngx_snprintf(args.data + cur_pos, args.len - cur_pos, "&%V=%V", &range->key, &range->value);
+        cur_pos += range->key.len + range->value.len + 2;  // '&xxx=yyy' = nr_x + nr_y + 2
+    }
+
+    return args;
+}
+
+static ngx_str_t ngx_str_generator(ngx_pool_t *pool, const char *str)
+{
+    ngx_str_t res = ngx_null_string;
+
+    ngx_int_t len = strlen(str);
+    res.data = ngx_palloc(pool, len);
+    if (!res.data)
+    {
+        return res;
+    }
+
+    res.len = len;
+    ngx_memcpy(res.data, str, res.len);
+    return res;
+}
+
+static ngx_str_t ngx_http_dav_string_splice(ngx_pool_t *pool, ngx_str_t *str1,
+                                            ngx_str_t *str2, ngx_str_t *str3)
+{
+    ngx_str_t new_str = ngx_null_string;
+    ngx_int_t len = str1->len + str2->len + str3->len;
+
+    new_str.data = ngx_palloc(pool, len);
+    if (!new_str.data)
+    {
+        return new_str;
+    }
+
+    new_str.len = len;
+    ngx_snprintf(new_str.data, new_str.len, "%V%V%V", str1, str2, str3);
+    return new_str;
 }
 
 
-static ngx_str_t
-subrequest_uri_generate_by_src_dst(ngx_http_request_t *r,
-                                    ngx_str_t *prefix,
-                                    ngx_str_t *method,
-                                    ngx_str_t *src,
-                                    ngx_str_t *dst)
-{
-    ngx_str_t src_prefix = ngx_string("&src=");
-    ngx_str_t dst_prefix = ngx_string("&dst=");
-    ngx_str_t user_prefix = ngx_string("&user=");
-
-    ngx_str_t uri;
-    uri.len = prefix->len + method->len + src->len + dst->len
-                + src_prefix.len + dst_prefix.len + user_prefix.len
-                + r->headers_in.user.len;
-    uri.data = ngx_palloc(r->pool, uri.len); // + 1
-    if (uri.data) {
-        ngx_snprintf(uri.data, uri.len, "%V%V%V%V%V%V%V%V", prefix, method, &user_prefix,
-                    &r->headers_in.user, &src_prefix, src, &dst_prefix, dst);
-        //uri.data[uri.len] = '\0';
-    }
-    return uri;
-}
-
-static int
+static ngx_int_t
 destination_uri_string_get(ngx_http_request_t *r, ngx_str_t *res_uri)
 {
     u_char *last, *p;
@@ -669,123 +1156,256 @@ ngx_http_dav_handler(ngx_http_request_t *r)
     ngx_int_t                 rc;
     ngx_http_dav_loc_conf_t  *dlcf;
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "-----isshe-----: int ngx_http_dav_handler----\n");
-
     rc = ngx_http_auth_basic_user(r);
 
     // 没有用户信息或者是解析错误，都返回错误
-    if (rc == NGX_DECLINED || rc == NGX_ERROR) {
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "failed to get user");
         return NGX_HTTP_BAD_REQUEST;
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "-----isshe-----: r->uri = %d:%s----\n", r->uri.len, r->uri.data);
-
-    if (r->headers_in.authorization && r->headers_in.authorization->value.len > 0) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "-----isshe-----: in ngx_http_dav_post_handler: user 1= %s---\n", r->headers_in.authorization->value.data);
-    }
-
-    if (r->headers_in.user.len > 0) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "-----isshe-----: in ngx_http_dav_post_handler: user 2= %s---\n", r->headers_in.user.data);
+    // 配置上下文, 这里是分配一个空的，在处理子请求的时候，再进行
+    ngx_http_dav_ctx_t *resp_ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    if (!resp_ctx)
+    {
+        resp_ctx = ngx_palloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+        if (!resp_ctx)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dav: get dav module ctx failed");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        // 清零 == 初始化各个成员
+        ngx_memzero(resp_ctx, sizeof(ngx_http_dav_ctx_t));
+        ngx_http_set_ctx(r, resp_ctx, ngx_http_dav_module);
     }
 
     // 提前校验
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
     if (!(r->method & dlcf->methods)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dav: not allow method:methods = %d:%d", r->method, dlcf->methods);
         return NGX_DECLINED;
     }
 
-    ngx_str_t sub_uri;
-    sub_uri.data = NULL;
-    sub_uri.len = 0;
-    ngx_str_t sub_prefix_update = ngx_string("/v1/admin/api/webdavd_update?method=");
-    ngx_str_t sub_prefix_shared = ngx_string("/v1/admin/api/webdavd_shared?method=");
+    if (dlcf->subrequest_uri.len <= 0 || dlcf->subrequest_uri.data == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dav: subrequest uri is not set");
+        return NGX_DECLINED;
+    }
+
+    ngx_str_t sub_uri = dlcf->subrequest_uri; // ngx_string("/v1/admin/api/webdavd");
+    ngx_str_t sub_src = ngx_null_string;
+    ngx_str_t sub_dst = r->unparsed_uri;        // r->uri -> r->unparsed_uri
+    ngx_str_t sub_method = ngx_null_string;
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: subrequest uri = %V.", &sub_uri);
+
     // 以下准备子请求的URI
     switch (r->method) {
         case NGX_HTTP_GET:
         {
-            ngx_str_t sub_method = ngx_string("get");
-            sub_uri = subrequest_uri_generate_by_dst(r, &sub_prefix_shared, &sub_method, &r->uri);
+            sub_method = ngx_str_generator(r->pool, "get");
+            break;
+        }
+        case NGX_HTTP_HEAD:
+        {
+            sub_method = ngx_str_generator(r->pool, "head");
+            break;
+        }
+        case NGX_HTTP_OPTIONS:
+        {
+            sub_method = ngx_str_generator(r->pool, "options");
             break;
         }
         case NGX_HTTP_PUT:
         {
-            // 无法上传目录
+            // 不允许上传目录
             if (r->uri.data[r->uri.len - 1] == '/') {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                               "cannot PUT to a collection");
                 return NGX_HTTP_CONFLICT;
             }
-            /*
-            if (r->headers_in.content_range) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "PUT with range is unsupported");
-                return NGX_HTTP_NOT_IMPLEMENTED;
-            }
-
-            r->request_body_in_file_only = 1;
-            r->request_body_in_persistent_file = 1;
-            r->request_body_in_clean_file = 1;
-            r->request_body_file_group_access = 1;
-            r->request_body_file_log_level = 0;
-            */
-            // 格式化 sub_uri
-            ngx_str_t sub_method = ngx_string("put");
-            sub_uri = subrequest_uri_generate_by_dst(r, &sub_prefix_update, &sub_method, &r->uri);
+            sub_method = ngx_str_generator(r->pool, "put");
             break;
         }
         case NGX_HTTP_DELETE:
         {
-            // 格式化 sub_uri
-            ngx_str_t sub_method = ngx_string("delete");
-            sub_uri = subrequest_uri_generate_by_dst(r, &sub_prefix_update, &sub_method, &r->uri);
+            sub_method = ngx_str_generator(r->pool, "delete");
             break;
         }
-
         case NGX_HTTP_MKCOL:
         {
-            // 格式化 sub_uri
-            ngx_str_t sub_method = ngx_string("mkcol");
-            sub_uri = subrequest_uri_generate_by_dst(r, &sub_prefix_update, &sub_method, &r->uri);
+            // 只允许创建目录
+            if (r->uri.data[r->uri.len - 1] != '/') {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "cannot MKCOL non-collection");
+                return NGX_HTTP_CONFLICT;
+            }
+            sub_method = ngx_str_generator(r->pool, "mkcol");
             break;
         }
         case NGX_HTTP_COPY:
         {
-            ngx_str_t duri;
-            if (destination_uri_string_get(r, &duri) != NGX_OK) {
+            sub_method = ngx_str_generator(r->pool, "copy");
+            if (destination_uri_string_get(r, &sub_dst) != NGX_OK) {
                 return NGX_HTTP_BAD_REQUEST;
             }
-            // 格式化 sub_uri
-            ngx_str_t sub_method = ngx_string("copy");
-            sub_uri = subrequest_uri_generate_by_src_dst(r, &sub_prefix_update, &sub_method, &r->uri, &duri);
+            sub_src = r->unparsed_uri;              // r->uri -> r->unparsed_uri
             break;
         }
         case NGX_HTTP_MOVE:
         {
-            ngx_str_t duri;
-            if (destination_uri_string_get(r, &duri) != NGX_OK) {
+            sub_method = ngx_str_generator(r->pool, "move");
+            if (destination_uri_string_get(r, &sub_dst) != NGX_OK) {
                 return NGX_HTTP_BAD_REQUEST;
             }
-            // 格式化 sub_uri
-            ngx_str_t sub_method = ngx_string("move");
-            sub_uri = subrequest_uri_generate_by_src_dst(r, &sub_prefix_update, &sub_method, &r->uri, &duri);
+            sub_src = r->unparsed_uri;              // r->uri -> r->unparsed_uri
             break;
         }
-    }
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "-----isshe-----: method = %d, sub_uri = %d:%s----\n", r->method, sub_uri.len, sub_uri.data);
+        case NGX_HTTP_PROPFIND:
+        {
+            sub_method = ngx_str_generator(r->pool, "propfind");
+            // propfind 作特殊处理
+            ngx_str_t sub_args = subrequest_args_generate(r, &sub_method, &r->headers_in.user,
+                    &sub_src, &sub_dst, &r->args, r->headers_in.depth, r->headers_in.range);
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                          "PROPFIND subrequest: uri = %V, args = %V, before replace.",
+                          &sub_uri, &sub_args);
 
-    if (sub_uri.len == 0 || !sub_uri.data) {
-        return NGX_DECLINED;
+            // 保存到上下文中
+            resp_ctx->sub_req_args = sub_args;
+            r->request_body_in_single_buf = 1;              // 放到1块buf里面，好读
+            rc = ngx_http_read_client_request_body(r, ngx_http_dav_propfind_subreq_handler);
+            if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+                return rc;
+            }
+            return NGX_DONE;
+        }
     }
 
-    rc = ngx_http_dav_subrequest_create(r, &sub_uri);
+    ngx_str_t sub_args = subrequest_args_generate(r, &sub_method, &r->headers_in.user,
+            &sub_src, &sub_dst, &r->args, r->headers_in.depth, r->headers_in.range);
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "COMMON subrequest: uri = %V, args = %V, before replace.",
+                  &sub_uri, &sub_args);
+
+    // 保存到上下文中
+    resp_ctx->sub_req_args = sub_args;
+
+    rc = ngx_http_dav_subrequest_create(r, &sub_uri, &sub_args,
+            ngx_http_dav_subrequest_post_handler, NULL);
     if (rc != NGX_OK) {
         return NGX_DECLINED;
     }
 
     // 如果是OK，就证明子请求已经创建, 接下来一定要返回NGX_DONE
     return NGX_DONE;
+}
+
+
+static ngx_str_t ngx_http_dav_propfind_data_get(ngx_http_request_t *r, ngx_chain_t *bufs)
+{
+    ngx_buf_t *buf = bufs->buf;
+    int i = 0;
+    int j = 0;
+
+    // 计算换行符个数
+    ngx_int_t lb_count = 0;
+    for (i = 0; buf->pos + i != buf->last; i++)
+    {
+        if (buf->pos[i] == '\n')
+        {
+            lb_count++;
+        }
+    }
+
+    ngx_str_t data_str = {buf->last - buf->pos, buf->pos};
+    if (lb_count == 0)
+    {
+        return data_str;
+    }
+
+    // 有换行符
+    data_str.len = i + (lb_count << 1);
+    data_str.data = ngx_palloc(r->pool, data_str.len);
+    if (!data_str.data)
+    {
+        data_str.len = 0;
+        return data_str;
+    }
+
+    for (i = 0, j = 0; buf->pos + i != buf->last; i++)
+    {
+        if (buf->pos[i] == '\n')
+        {
+            data_str.data[j++] = '%';
+            data_str.data[j++] = '0';
+            data_str.data[j++] = 'A';
+        }
+        else
+        {
+            data_str.data[j++] = buf->pos[i];
+        }
+    }
+
+    return data_str;
+}
+
+static void ngx_http_dav_propfind_subreq_handler(ngx_http_request_t *r)
+{
+    // 标准的propfind请求是有请求体(request body)的，因此这里做检测，如果没有，就直接返回错误
+    ngx_uint_t status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    if (!r->request_body || !r->request_body->bufs || !r->request_body->bufs->buf)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: request body is empty");
+        status = NGX_HTTP_BAD_REQUEST;
+        ngx_http_finalize_request(r, status);
+        return;
+    }
+
+    // 获取上下文
+    ngx_http_dav_ctx_t *resp_ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    ngx_http_dav_loc_conf_t *dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
+    if (!resp_ctx || !dlcf)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dav: get module context or location config failed");
+        ngx_http_finalize_request(r, status);
+        return;
+    }
+
+    // propfind请求的子请求需要有data部分，因此这里吧data作为参数给子请求
+    //ngx_buf_t *b = r->request_body->bufs->buf;
+    ngx_str_t data_prefix = ngx_string("&data=");
+    ngx_str_t def_data = ngx_string("<?xml version=\"1.0\" encoding=\"UTF-8\"?><d:propfind xmlns:d=\"DAV:\"><d:allprop/></d:propfind>");
+    ngx_str_t data_str = ngx_http_dav_propfind_data_get(r, r->request_body->bufs);
+    if (data_str.len == 0 || !data_str.data)
+    {
+        data_str = def_data;
+    }
+    ngx_str_t new_args = ngx_http_dav_string_splice(r->pool,
+            &resp_ctx->sub_req_args, &data_prefix, &data_str);
+    if (new_args.len <= 0 || new_args.data == NULL)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: generate new args failed");
+        ngx_http_finalize_request(r, status);
+        return;
+    }
+
+    // 创建子请求
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: subrequest new args = %V", &new_args);
+    resp_ctx->sub_req_args = new_args;
+    status = ngx_http_dav_subrequest_create(r, &dlcf->subrequest_uri,
+            &resp_ctx->sub_req_args, ngx_http_dav_subrequest_post_handler, NULL);
+    if (status != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: create subrequest failed");
+        ngx_http_finalize_request(r, status);
+        return;
+    }
 }
 
 
@@ -821,7 +1441,7 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
 
     path.len--;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http put filename: \"%s\"", path.data);
 
     temp = &r->request_body->temp_file->file.name;
@@ -1200,6 +1820,86 @@ ngx_http_dav_destination_get(ngx_http_request_t *r, ngx_table_elt_t *dest)
 }
 
 static ngx_int_t
+ngx_http_dav_options_handler(ngx_http_request_t *r)
+{
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "dav: options");
+
+    ngx_http_dav_ctx_t *resp_ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    if (!resp_ctx) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "dav: get response context failed");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_str_set(&h->key, "DAV");
+    ngx_str_set(&h->value, "1");
+    h->hash = 1;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_str_set(&h->key, "Allow");
+    h->value.len = resp_ctx->data.len;
+    h->value.data = resp_ctx->data.data;
+    //ngx_str_set(&h->value, "GET,HEAD,PUT,DELETE,MKCOL,COPY,MOVE,PROPFIND,OPTIONS");
+    h->hash = 1;
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->header_only = 1;
+    r->headers_out.content_length_n = 0;
+
+    ngx_http_send_header(r);
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_propfind_handler(ngx_http_request_t *r)
+{
+    // 获取请求上下文，子请求已经进行保存
+    ngx_http_dav_ctx_t *resp_ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    if (!resp_ctx) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "dav: get response context failed");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    int bodylen = resp_ctx->data.len;
+    ngx_buf_t *buf = ngx_create_temp_buf(r->pool, bodylen);
+    if (!buf)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_memcpy(buf->pos, resp_ctx->data.data, bodylen);
+    buf->last = buf->pos + bodylen;
+    buf->last_buf = 1;                      // 是最后一个buf
+    ngx_chain_t out;
+    out.buf = buf;
+    out.next = NULL;
+    r->connection->buffered |= NGX_HTTP_WRITE_BUFFERED;
+
+    // 发送头部
+    static ngx_str_t type = ngx_string("text/xml; charset=UTF-8");
+    r->headers_out.content_type = type;
+    r->headers_out.status = NGX_HTTP_MULTI_STATUS;
+    r->headers_out.content_length_n = bodylen;
+    ngx_str_set(&r->headers_out.status_line, "207 Multi-Status");
+
+    ngx_int_t rc = ngx_http_send_header(r);
+    if (rc != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    return ngx_http_output_filter(r, &out);
+}
+
+static ngx_int_t
 ngx_http_dav_copy_move_handler(ngx_http_request_t *r)
 {
     u_char                   *p, *last, ch; // *host,
@@ -1241,7 +1941,6 @@ ngx_http_dav_copy_move_handler(ngx_http_request_t *r)
     flags = NGX_HTTP_LOG_UNSAFE;
 
     if (ngx_http_parse_unsafe_uri(r, &duri, &args, &flags) != NGX_OK) {
-        //goto invalid_destination;
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "client sent invalid \"Destination\" header: \"%V\"",
                       &dest->value);
@@ -1570,7 +2269,6 @@ failed:
     return NGX_OK;
 }
 
-
 static ngx_int_t
 ngx_http_dav_copy_tree_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
 {
@@ -1737,6 +2435,8 @@ ngx_http_dav_create_loc_conf(ngx_conf_t *cf)
     conf->min_delete_depth = NGX_CONF_UNSET_UINT;
     conf->access = NGX_CONF_UNSET_UINT;
     conf->create_full_put_path = NGX_CONF_UNSET;
+    conf->subrequest_uri.len = 0;
+    conf->subrequest_uri.data = NULL;
 
     return conf;
 }
@@ -1749,7 +2449,7 @@ ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_dav_loc_conf_t  *conf = child;
 
     ngx_conf_merge_bitmask_value(conf->methods, prev->methods,
-                         (NGX_CONF_BITMASK_SET|NGX_HTTP_DAV_OFF));
+                         (NGX_CONF_BITMASK_SET));//|NGX_HTTP_DAV_OFF));
 
     ngx_conf_merge_uint_value(conf->min_delete_depth,
                          prev->min_delete_depth, 0);
@@ -1759,6 +2459,7 @@ ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->create_full_put_path,
                          prev->create_full_put_path, 0);
 
+    ngx_conf_merge_str_value(conf->subrequest_uri, prev->subrequest_uri, "");
     return NGX_CONF_OK;
 }
 
@@ -1789,5 +2490,5 @@ ngx_http_dav_deal_with(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     clcf->handler = ngx_http_dav_handler;
 
-    return NGX_OK;
+    return NGX_CONF_OK;
 }

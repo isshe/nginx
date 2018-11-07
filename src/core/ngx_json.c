@@ -58,6 +58,12 @@ static ngx_json* ngx_create_json(ngx_pool_t *pool, ngx_json_type type, const cha
   assert(js);
   js->type=type;
   js->key=key;
+  js->text_value = NULL;
+  js->int_value = 0;
+  js->dbl_value = 0.0;
+  js->child = NULL;
+  js->next = NULL;
+  js->last_child = NULL;
   if (!parent->last_child) {
     parent->child=parent->last_child=js;
   }
@@ -70,7 +76,7 @@ static ngx_json* ngx_create_json(ngx_pool_t *pool, ngx_json_type type, const cha
 }
 
 void ngx_json_free(ngx_pool_t *pool, const ngx_json* js) {
-
+  
   ngx_json* p=js->child;
   ngx_json* p1;
   while (p) {
@@ -79,7 +85,7 @@ void ngx_json_free(ngx_pool_t *pool, const ngx_json* js) {
     p=p1;
   }
   NX_JSON_FREE(pool, js);
-
+  
 }
 
 static int ngx_unicode_to_utf8(unsigned int codepoint, char* p, char** endp) {
@@ -389,13 +395,13 @@ const ngx_json* ngx_json_item(const ngx_json* json, int idx) {
 
 static void do_ngx_json_print(ngx_uint_t level, ngx_log_t *log, const ngx_json *p)
 {
-    if (p)
+    if (p) 
     {
       switch(p->type) {
         case NX_JSON_STRING:
           if (p->text_value) {
-            ngx_log_debug2(level, log, 0, "%s:%s", p->key, p->text_value);
-          }
+		  	ngx_log_debug2(level, log, 0, "%s:%s", p->key, p->text_value);
+		  }
           break;
         case NX_JSON_INTEGER:
           ngx_log_debug2(level, log, 0, "%s:%d", p->key, p->int_value);
@@ -405,8 +411,8 @@ static void do_ngx_json_print(ngx_uint_t level, ngx_log_t *log, const ngx_json *
           break;
         default:
           if (p->text_value) {
-            ngx_log_debug2(level, log, 0, "%s:%s", p->key, p->text_value);
-          }
+		  	ngx_log_debug2(level, log, 0, "%s:%s", p->key, p->text_value);
+		  }
           break;
       }
   }

@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 typedef enum ngx_json_type {
-  NX_JSON_NULL,    // this is null value
+  NX_JSON_NULL = 0,    // this is null value
   NX_JSON_OBJECT,  // this is an object; properties can be found in child nodes
   NX_JSON_ARRAY,   // this is an array; items can be found in child nodes
   NX_JSON_STRING,  // this is a string; value can be found in text_value field
