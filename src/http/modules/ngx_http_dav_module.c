@@ -59,9 +59,6 @@ static ngx_int_t ngx_http_dav_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_get_head_handler(ngx_http_request_t *r);
 
 static void ngx_http_dav_put_handler(ngx_http_request_t *r);
-#if (NGX_HTTP_V2)
-static void ngx_http_v2_dav_put_handler(ngx_http_request_t *r);
-#endif
 static void ngx_http_dav_propfind_subreq_handler(ngx_http_request_t *r);
 
 static ngx_int_t ngx_http_dav_delete_handler(ngx_http_request_t *r);
@@ -1263,18 +1260,7 @@ ngx_http_dav_subrequest_post_handler(ngx_http_request_t *r, void *data, ngx_int_
             pr->write_event_handler = write_event_handler_bk;             // 恢复回调
             resp_ctx->data_handler = ngx_http_dav_write_dst_file;
             resp_ctx->response_status = NGX_HTTP_OK;
-#if (NGX_HTTP_V2)
-            if (pr->stream) {
-                pr->request_body_no_buffering = 1;
 
-                rc = ngx_http_read_client_request_body(pr, ngx_http_v2_dav_put_handler);
-                if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-                    break;
-                }
-                pr->headers_out.status = NGX_HTTP_OK;
-                return NGX_DONE;
-            }
-#endif
             // NOT HTTP_V2
             rc = ngx_http_dav_read_client_request_body(pr);
             if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
@@ -1894,108 +1880,6 @@ ngx_http_dav_send_response_handler(ngx_http_request_t *r, ngx_http_dav_ctx_t *ct
     ngx_http_finalize_request(r, ngx_http_send_header(r));
     return;
 }
-
-#if (NGX_HTTP_V2)
-static void
-ngx_http_v2_dav_put_handler(ngx_http_request_t *r)
-{
-    ngx_http_request_body_t     *rb;
-    ngx_int_t                   rc;
-    ngx_chain_t                 *in;
-    ssize_t                     n, limit, buf_read_size, next_buf_size, remaining;
-    ngx_msec_t                  delay;
-    ngx_event_t                 *rev;
-
-    if (ngx_exiting || ngx_terminate) {
-        ngx_http_finalize_request(r, NGX_HTTP_CLOSE);
-        return;
-    }
-
-    rev = r->connection->read;
-    rb = r->request_body;
-
-    if (rb == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    r->read_event_handler = ngx_http_v2_dav_put_handler;
-
-    ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
-
-    for ( ;; ) {
-        buf_read_size = 0;
-
-        for (in = rb->bufs ; in; in = in->next) {
-            n = in->buf->last - in->buf->pos;
-
-            rc = ctx->data_handler(r, ctx, in->buf->pos, (size_t)n);
-
-            in->buf->pos += n;
-            ctx->upload_received += n;
-            buf_read_size += n;
-
-            if (rc != NGX_OK) {
-                ngx_http_finalize_request(r, rc);
-                return;
-            }
-        }
-        rb->bufs = NULL;
-
-        // We're done reading the request body, break out of loop
-        if (!r->reading_body) {
-            rc = ctx->data_handler(r, ctx, NULL, 0);
-            if (rc == NGX_OK) {
-                break;
-            } else {
-                ngx_http_finalize_request(r, rc);
-                return;
-            }
-        }
-
-        // Check whether we have exceeded limit_rate and should delay the next
-        // buffer read
-        if (ctx->upload_limit_rate) {
-            remaining = ((ssize_t) r->headers_in.content_length_n) - ctx->upload_received;
-            next_buf_size = (buf_read_size > remaining) ? remaining : buf_read_size;
-            limit = ctx->upload_limit_rate * (ngx_time() - r->start_sec + 1) - (ctx->upload_received + next_buf_size);
-            if (limit < 0) {
-                rev->delayed = 1;
-                ngx_add_timer(rev, (ngx_msec_t) ((limit * -1000 / ctx->upload_limit_rate) + 1));
-                return;
-            }
-        }
-
-        rc = ngx_http_read_unbuffered_request_body(r);
-        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-            ngx_http_finalize_request(r, rc);
-            return;
-        }
-
-        if (rb->bufs == NULL) {
-            return;
-        }
-
-        // Check whether we should delay processing the latest request body
-        // buffers to stay within limit_rate
-        if (ctx->upload_limit_rate) {
-            buf_read_size = 0;
-            for (in = rb->bufs ; in; in = in->next) {
-                buf_read_size += (in->buf->last - in->buf->pos);
-            }
-            delay = (ngx_msec_t) (buf_read_size * 1000 / ctx->upload_limit_rate + 1);
-            if (delay > 0) {
-                rev->delayed = 1;
-                ngx_add_timer(rev, delay);
-                return;
-            }
-        }
-    }
-
-    // Finally, send the response
-    ngx_http_dav_send_response_handler(r, ctx);
-}
-#endif
 
 static ngx_int_t
 ngx_http_dav_delete_handler(ngx_http_request_t *r)
