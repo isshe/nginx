@@ -297,6 +297,13 @@ static ngx_int_t ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
  */
 static ngx_int_t ngx_http_dav_process_request_body(ngx_http_request_t *r, ngx_chain_t *body);
 
+/**
+ * 做一些收尾工作：关闭文件描述符等
+ * @param r
+ * @param ctx
+ */
+static void ngx_http_dav_shutdown_ctx(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx);
+
 static ngx_conf_bitmask_t  ngx_http_dav_methods_mask[] = {
     //{ ngx_string("off"), NGX_HTTP_DAV_OFF },
     { ngx_string("get"), NGX_HTTP_GET},
@@ -810,6 +817,19 @@ ngx_http_dav_check_error(ngx_http_request_t *r, const char *str, ngx_int_t len)
     return NGX_HTTP_OK;
 }
 
+static void
+ngx_http_dav_shutdown_ctx(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
+{
+    // 关闭文件描述符
+    if (ctx->dst_fd != NGX_INVALID_FILE) {
+        if (ngx_close_file(ctx->dst_fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                          ngx_close_file_n " \"%s\" failed", ctx->dst_path);
+        }
+        ctx->dst_fd = NGX_INVALID_FILE;
+    }
+}
+
 static ngx_int_t
 ngx_http_dav_process_request_body(ngx_http_request_t *r, ngx_chain_t *body)
 {
@@ -843,7 +863,7 @@ ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
     c = r->connection;
     rb = r->request_body;
 
-    ngx_log_debug(NGX_LOG_DEBUG_HTTP, c->log, 0, "dav: http read client request body");
+    //ngx_log_debug(NGX_LOG_DEBUG_HTTP, c->log, 0, "dav: http read client request body");
 
     for ( ;; ) {
         for ( ;; ) {
@@ -884,8 +904,8 @@ ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
 
             n = c->recv(c, rb->buf->last, size);
 
-            ngx_log_debug(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                           "dav: http client request body recv %z", n);
+            //ngx_log_debug(NGX_LOG_DEBUG_HTTP, c->log, 0,
+            //               "dav: http client request body recv %z", n);
 
             if (n == NGX_AGAIN) {
                 break;
@@ -915,6 +935,9 @@ ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
             }
 
             if (ctx->upload_limit_rate) {
+                // 速度 = 路程 / 时间
+                // => 时间 = 路程 / 速度
+                // 所以实现限速的方法就是：针对每次接收进行延时。
                 delay = (ngx_msec_t) (n * 1000 / ctx->upload_limit_rate + 1);
 
                 if (delay > 0) {
@@ -925,8 +948,8 @@ ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
             }
         }
 
-        ngx_log_debug(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http client request body rest %uz", rb->rest);
+        //ngx_log_debug(NGX_LOG_DEBUG_HTTP, c->log, 0,
+        //               "http client request body rest %uz", rb->rest);
 
         if (rb->rest == 0) {
             break;
@@ -949,8 +972,9 @@ ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
 
     rc = ngx_http_dav_process_request_body(r, ctx->to_write);
 
+    ngx_http_dav_shutdown_ctx(r, ctx);
     ngx_http_dav_send_response_handler(r, ctx);
-   return NGX_OK;
+    return NGX_OK;
 }
 
 static void
@@ -965,6 +989,7 @@ ngx_http_dav_read_client_request_body_handler(ngx_http_request_t *r)
 
         if(!rev->delayed) {
             r->connection->timedout = 1;
+            ngx_http_dav_shutdown_ctx(r, ctx);
             ngx_http_finalize_request(r, NGX_HTTP_REQUEST_TIME_OUT);
             return;
         }
@@ -977,6 +1002,7 @@ ngx_http_dav_read_client_request_body_handler(ngx_http_request_t *r)
             ngx_add_timer(rev, clcf->client_body_timeout);
 
             if (ngx_handle_read_event(rev, clcf->send_lowat) != NGX_OK) {
+                ngx_http_dav_shutdown_ctx(r, ctx);
                 ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             }
 
@@ -991,6 +1017,7 @@ ngx_http_dav_read_client_request_body_handler(ngx_http_request_t *r)
                            "http read delayed");
 
             if (ngx_handle_read_event(rev, clcf->send_lowat) != NGX_OK) {
+                ngx_http_dav_shutdown_ctx(r, ctx);
                 ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             }
 
@@ -1001,6 +1028,7 @@ ngx_http_dav_read_client_request_body_handler(ngx_http_request_t *r)
     rc = ngx_http_dav_do_read_client_request_body(r);
 
     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        ngx_http_dav_shutdown_ctx(r, ctx);
         ngx_http_finalize_request(r, rc);
     }
 }
@@ -1018,20 +1046,21 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 #if defined nginx_version && nginx_version >= 8011
     r->main->count++;
 #endif
-
     if (r->request_body || r->discard_body) {
         return NGX_OK;
     }
 
     rb = ngx_pcalloc(r->pool, sizeof(ngx_http_request_body_t));
     if (rb == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_OK;
     }
 
     r->request_body = rb;
 
-    if (r->headers_in.content_length_n <= 0) {
-        return NGX_HTTP_BAD_REQUEST;
+    if (r->headers_in.content_length_n < 0) {
+        ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
+        return NGX_OK;
     }
 
     /*
@@ -1041,21 +1070,21 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
      *     rb->buf = NULL;
      *     rb->rest = 0;
      */
-
     preread = r->header_in->last - r->header_in->pos;
 
-    if (preread) {
+    if (preread || r->headers_in.content_length_n == 0) {
 
         /* there is the pre-read part of the request body */
 
         ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http client request body preread %uz", preread);
+                       "dav: http client request body preread %uz", preread);
 
         ctx->upload_received = preread;
 
         b = ngx_calloc_buf(r->pool);
         if (b == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return NGX_OK;
         }
 
         b->temporary = 1;
@@ -1066,13 +1095,15 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
         rb->bufs = ngx_alloc_chain_link(r->pool);
         if (rb->bufs == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return NGX_OK;
         }
 
         rb->bufs->buf = b;
         rb->bufs->next = NULL;
         rb->buf = b;
 
+        // 意味着全部东西都在preread中了
         if (preread >= r->headers_in.content_length_n) {
 
             /* the whole request body was pre-read */
@@ -1080,10 +1111,13 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
             r->header_in->pos += r->headers_in.content_length_n;
             r->request_length += r->headers_in.content_length_n;
 
+            // 处理请求体，当前是写到文件
             if (ngx_http_dav_process_request_body(r, rb->bufs) != NGX_OK) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return NGX_OK;
             }
 
+            // 处理完了，发送响应
             ngx_http_dav_send_response_handler(r, ctx);
             return NGX_OK;
         }
@@ -1096,6 +1130,7 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
         r->request_length += preread;
 
+        // rb-rest: 剩下需要读的
         rb->rest = r->headers_in.content_length_n - preread;
 
         if (rb->rest <= (off_t) (b->end - b->last)) {
@@ -1104,8 +1139,10 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
             ctx->to_write = rb->bufs;
 
+            // 设置好读回调，然后进行读
             r->read_event_handler = ngx_http_dav_read_client_request_body_handler;
-            return ngx_http_dav_do_read_client_request_body(r);
+            ngx_http_dav_do_read_client_request_body(r);
+            return NGX_OK;
         }
 
         next = &rb->bufs->next;
@@ -1137,12 +1174,14 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
     rb->buf = ngx_create_temp_buf(r->pool, size);
     if (rb->buf == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_OK;
     }
 
     cl = ngx_alloc_chain_link(r->pool);
     if (cl == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_OK;
     }
 
     cl->buf = rb->buf;
@@ -1162,7 +1201,8 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
     r->read_event_handler = ngx_http_dav_read_client_request_body_handler;
 
-    return ngx_http_dav_do_read_client_request_body(r);
+    ngx_http_dav_do_read_client_request_body(r);
+    return NGX_OK;
 }
 
 
@@ -1798,7 +1838,7 @@ ngx_http_dav_write_dst_file(ngx_http_request_t *r, struct ngx_http_dav_ctx_s* ct
     ngx_file_info_t fi;
     ngx_uint_t status = NGX_HTTP_OK;
 
-    if (!begin || len <= 0) {
+    if (!begin) {
         if (ngx_close_file(ctx->dst_fd) == NGX_FILE_ERROR) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
                       ngx_close_file_n " \"%s\" failed", ctx->dst_path);
@@ -1845,16 +1885,18 @@ ngx_http_dav_write_dst_file(ngx_http_request_t *r, struct ngx_http_dav_ctx_s* ct
     }
 
     // 写文件
-    ssize_t wlen = ngx_write_fd(fd, begin, len);
-    if (wlen == -1) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                      ngx_write_fd_n " to \"%s\" failed",
-                ctx->dst_path.data);
+    if (len > 0) {
+        ssize_t wlen = ngx_write_fd(fd, begin, len);
+        if (wlen == -1) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                          ngx_write_fd_n " to \"%s\" failed",
+                    ctx->dst_path.data);
 
-    } else if ((size_t) wlen != len) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      ngx_write_fd_n " to \"%s\" was incomplete: %z of %uz",
-                ctx->dst_path.data, wlen, len);
+        } else if ((size_t) wlen != len) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          ngx_write_fd_n " to \"%s\" was incomplete: %z of %uz",
+                    ctx->dst_path.data, wlen, len);
+        }
     }
 
     return NGX_OK;
@@ -1878,7 +1920,6 @@ ngx_http_dav_send_response_handler(ngx_http_request_t *r, ngx_http_dav_ctx_t *ct
     r->header_only = 1;
 
     ngx_http_finalize_request(r, ngx_http_send_header(r));
-    return;
 }
 
 static ngx_int_t
@@ -2313,6 +2354,13 @@ ngx_http_dav_copy_move_handler(ngx_http_request_t *r)
     duri.data = p;
     flags = NGX_HTTP_LOG_UNSAFE;
 
+    // 不考虑源文件不存在的情况（uri为源，duri为目的）
+    if (duri.len == r->uri.len && ngx_strncmp(duri.data, r->uri.data, duri.len) == 0) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                      "dav: src and dst uri are the same");
+        return NGX_HTTP_NO_CONTENT;
+    }
+
     if (ngx_http_parse_unsafe_uri(r, &duri, &args, &flags) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "client sent invalid \"Destination\" header: \"%V\"",
@@ -2380,8 +2428,8 @@ overwrite_done:
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http copy from: \"%s\"", path.data);
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http copy/move from: \"%s\"", path.data);
 
     uri = r->uri;
     r->uri = duri;
