@@ -335,13 +335,6 @@ static ngx_int_t ngx_http_dav_create_and_open_temp_file(ngx_http_request_t *r, n
  */
 static ngx_int_t ngx_http_dav_move_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx);
 
-/**
- * 删除临时文件（主动中断上传文件时会产生）
- * @param r
- * @param ctx
- */
-static void ngx_http_delete_temp_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx);
-
 static ngx_conf_bitmask_t  ngx_http_dav_methods_mask[] = {
     //{ ngx_string("off"), NGX_HTTP_DAV_OFF },
     { ngx_string("get"), NGX_HTTP_GET},
@@ -865,14 +858,7 @@ ngx_http_dav_check_error(ngx_http_request_t *r, const char *str, ngx_int_t len)
 static void
 ngx_http_dav_shutdown_ctx(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
 {
-    // 关闭文件描述符
-    if (ctx->file.fd != NGX_INVALID_FILE) {
-        if (ngx_close_file(ctx->file.fd) == NGX_FILE_ERROR) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                          ngx_close_file_n " \"%V\" failed", &ctx->file.name);
-        }
-        ctx->file.fd = NGX_INVALID_FILE;
-    }
+    // 这里做一些清理工作，当前什么也不需要做
 }
 
 static ngx_int_t
@@ -963,10 +949,6 @@ ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
 
             if (n == 0 || n == NGX_ERROR) {
                 c->error = 1;
-                // 出错，删除临时文件
-                if (ctx->use_temp_file) {
-                    ngx_http_delete_temp_file(r, ctx);
-                }
                 return NGX_HTTP_BAD_REQUEST;
             }
 
@@ -1027,11 +1009,7 @@ ngx_http_dav_do_read_client_request_body(ngx_http_request_t *r)
         if (ctx->response_status < NGX_HTTP_SPECIAL_RESPONSE) {
             // 把临时文件移动到目标目录
             ngx_http_dav_move_file(r, ctx);
-        } else {
-            // 出错或者用户中断了上传，就删除临时文件（如果存在）
-            ngx_http_delete_temp_file(r, ctx);
         }
-
     }
 
     ngx_http_dav_send_response_handler(r, ctx);
@@ -1081,16 +1059,6 @@ ngx_http_dav_move_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
     }
 
     return NGX_OK;
-}
-
-static void
-ngx_http_delete_temp_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
-{
-    // 删除临时文件，直接删除，不必判断是否存在
-    if (ngx_delete_file(ctx->file.name.data) == NGX_FILE_ERROR) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, NGX_EISDIR,
-                      "dav: delete temp file failed: %s", ctx->file.name.data);
-    }
 }
 
 static void
@@ -1846,7 +1814,7 @@ ngx_http_dav_handler(ngx_http_request_t *r)
 
             // 保存到上下文中
             resp_ctx->sub_req_args = sub_args;
-            r->request_body_in_single_buf = 1;              // 放到1块buf里面，好读
+            //r->request_body_in_single_buf = 1;              // 放到1块buf里面，好读
             rc = ngx_http_read_client_request_body(r, ngx_http_dav_propfind_subreq_handler);
             if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
                 return rc;
@@ -1876,28 +1844,35 @@ ngx_http_dav_handler(ngx_http_request_t *r)
 
 static ngx_str_t ngx_http_dav_propfind_data_get(ngx_http_request_t *r, ngx_chain_t *bufs)
 {
-    ngx_buf_t *buf = bufs->buf;
+    ngx_chain_t *cl = NULL;
+    ngx_buf_t *buf = NULL;
     int i = 0;
     int j = 0;
+    ngx_str_t data_str = ngx_null_string;
 
     // 计算换行符个数
-    ngx_int_t lb_count = 0;
-    for (i = 0; buf->pos + i != buf->last; i++)
-    {
-        if (buf->pos[i] == '\n')
-        {
-            lb_count++;
-        }
-    }
-
-    ngx_str_t data_str = {buf->last - buf->pos, buf->pos};
-    if (lb_count == 0)
-    {
+    ngx_int_t content_count = r->headers_in.content_length_n;
+    if (content_count <= 0) {
         return data_str;
     }
 
-    // 有换行符
-    data_str.len = i + (lb_count << 1);
+    ngx_int_t lb_count = 0;
+
+    for (cl = bufs; cl; cl = cl->next) {
+
+        buf = cl->buf;
+
+        for (i = 0; buf && buf->pos + i != buf->last; i++)
+        {
+            if (buf->pos[i] == '\n')
+            {
+                lb_count++;
+            }
+        }
+    }
+
+    // '\n' -> "%0A", 增加了2个字符
+    data_str.len = content_count + (lb_count << 1);
     data_str.data = ngx_palloc(r->pool, data_str.len);
     if (!data_str.data)
     {
@@ -1905,17 +1880,23 @@ static ngx_str_t ngx_http_dav_propfind_data_get(ngx_http_request_t *r, ngx_chain
         return data_str;
     }
 
-    for (i = 0, j = 0; buf->pos + i != buf->last; i++)
-    {
-        if (buf->pos[i] == '\n')
+    j = 0;
+    for (cl = bufs; cl; cl = cl->next) {
+
+        buf = cl->buf;
+
+        for (i = 0; buf && buf->pos + i != buf->last; i++)
         {
-            data_str.data[j++] = '%';
-            data_str.data[j++] = '0';
-            data_str.data[j++] = 'A';
-        }
-        else
-        {
-            data_str.data[j++] = buf->pos[i];
+            if (buf->pos[i] == '\n')
+            {
+                data_str.data[j++] = '%';
+                data_str.data[j++] = '0';
+                data_str.data[j++] = 'A';
+            }
+            else
+            {
+                data_str.data[j++] = buf->pos[i];
+            }
         }
     }
 
@@ -1948,7 +1929,8 @@ static void ngx_http_dav_propfind_subreq_handler(ngx_http_request_t *r)
     // propfind请求的子请求需要有data部分，因此这里吧data作为参数给子请求
     //ngx_buf_t *b = r->request_body->bufs->buf;
     ngx_str_t data_prefix = ngx_string("&data=");
-    ngx_str_t def_data = ngx_string("<?xml version=\"1.0\" encoding=\"UTF-8\"?><d:propfind xmlns:d=\"DAV:\"><d:allprop/></d:propfind>");
+    ngx_str_t def_data = ngx_string("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                                    "<d:propfind xmlns:d=\"DAV:\"><d:allprop/></d:propfind>");
     ngx_str_t data_str = ngx_http_dav_propfind_data_get(r, r->request_body->bufs);
     if (data_str.len == 0 || !data_str.data)
     {
@@ -2009,13 +1991,10 @@ ngx_http_dav_map_dst_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
     return NGX_OK;
 }
 
-static ngx_int_t 
+static ngx_int_t
 ngx_http_dav_create_and_open_temp_file(ngx_http_request_t *r, struct ngx_http_dav_ctx_s *ctx)
 {
-    uint32_t                  n;
-    ngx_err_t                 err;
     ngx_path_t               *path;
-    ngx_file_t               *file;
     ngx_http_dav_loc_conf_t  *dlcf;
 
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
@@ -2027,68 +2006,20 @@ ngx_http_dav_create_and_open_temp_file(ngx_http_request_t *r, struct ngx_http_da
         return NGX_ERROR;
     }
 
-    file = &ctx->file;
+    if (ngx_create_temp_file(&ctx->file, path, r->pool, 1, 1, NGX_FILE_DEFAULT_ACCESS) != NGX_OK)
+    {
 
-    file->name.len = path->name.len + 1 + path->len + 10;
-    file->name.data = ngx_pnalloc(r->pool, file->name.len + 1);
-    if (file->name.data == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                        "dav: can't alloc memory for file name!");
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "dav: hashed path: error!");
         ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
         return NGX_ERROR;
     }
 
-    ngx_memcpy(file->name.data, path->name.data, path->name.len);
-
-    n = (uint32_t) ngx_next_temp_number(0);
-
-    for ( ;; ) {
-        (void) ngx_sprintf(file->name.data + path->name.len + 1 + path->len,
-                           "%010uD%Z", n);
-
-        ngx_create_hashed_filename(path, file->name.data, file->name.len);
-
-        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "dav: hashed path: %s", file->name.data);
-
-        file->fd = ngx_open_file(file->name.data, O_RDWR | O_EXCL,
-                O_CREAT, NGX_FILE_DEFAULT_ACCESS);
-        //file->fd = ngx_open_tempfile(file->name.data, persistent, access);
-
-        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "dav: temp fd: %d", file->fd);
-
-        if (file->fd != NGX_INVALID_FILE) {
-            break;
-        }
-
-        err = ngx_errno;
-
-        if (err == NGX_EEXIST_FILE) {
-            n = (uint32_t) ngx_next_temp_number(1);
-            continue;
-        }
-
-        if ((path->level[0] == 0) || (err != NGX_ENOPATH)) {
-            ngx_log_error(NGX_LOG_CRIT, file->log, err,
-                          ngx_open_tempfile_n " \"%s\" failed",
-                          file->name.data);
-            ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
-            return NGX_ERROR;
-        }
-
-        if (ngx_create_path(file, path) == NGX_ERROR) {
-            ngx_log_error(NGX_LOG_CRIT, file->log, err,
-                          "create path failed: %V", path->name);
-            ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
-            return NGX_ERROR;
-        }
-    }
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "dav: hashed path: %s", ctx->file.name.data);
 
     return NGX_OK;
 }
-
-
 
 static ngx_int_t
 ngx_http_dav_write_dst_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx, u_char *begin, size_t len)
