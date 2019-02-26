@@ -19,6 +19,48 @@
 #define NGX_HTTP_DAV_ERROR_CODE_MIN  400
 #define NGX_HTTP_DAV_ERROR_CODE_MAX  999
 #define NGX_HTTP_DAV_MAX_INT_LEN     64
+#define NGX_HTTP_DAV_COPY_THRESHOLD  65536 //8192
+#define NGX_HTTP_DAV_NONEED_RELEASE  0
+#define NGX_HTTP_DAV_NEED_RELEASE    (~NGX_HTTP_DAV_NONEED_RELEASE)
+
+#define NGX_HTTP_DAV_WAIT           (NGX_ABORT - 1)
+
+//#define NGX_HTTP_DAV_DEBUG      // 开调试
+
+#ifdef NGX_HTTP_DAV_DEBUG
+#define dav_opened_fd_log_debug(log, fd) \
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: opened fd: %d(need close)", fd)
+#define dav_closed_fd_log_debug(log, fd) \
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: closed fd: %d", fd)
+
+#define dav_allocated_mem_log_debug(log, p, need_release) \
+    if (need_release == NGX_HTTP_DAV_NEED_RELEASE) { \
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: allocated memory: 0x%p(need release)", p); \
+    } else { \
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: allocated memory: 0x%p(no need release)", p); \
+    }
+#define dav_released_mem_log_debug(log, p) \
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: released memory: 0x%p", p)
+
+#define dav_opend_dir_log_debug(log, dir) \
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: opened directory: 0x%p(need close)", dir)
+#define dav_closed_dir_log_debug(log, dir) \
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: closed directory: 0x%p", dir)
+#define dav_queue_insert_log_debug(log, str) \
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: queue insert: %s", str)
+#define dav_queue_remove_log_debug(log, str) \
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, log, 0, "dav: queue remove: %s", str)
+#else
+#define dav_opened_fd_log_debug(log, fd)
+#define dav_closed_fd_log_debug(log, fd)
+#define dav_allocated_mem_log_debug(log, p, need_release)
+#define dav_released_mem_log_debug(log, p)
+#define dav_opend_dir_log_debug(log, dir)
+#define dav_closed_dir_log_debug(log, dir)
+#define dav_queue_insert_log_debug(log, str)
+#define dav_queue_remove_log_debug(log, str)
+#endif
+
 
 static ngx_path_init_t  ngx_http_dav_client_temp_path = {
         ngx_string(NGX_HTTP_CLIENT_TEMP_PATH), { 0, 0, 0 }
@@ -30,7 +72,8 @@ typedef struct {
     ngx_uint_t  min_delete_depth;
     ngx_flag_t  create_full_put_path;
     ngx_str_t   subrequest_uri;             // 子请求的uri，再conf里设置
-    size_t      upload_limit_rate;                 // 限速
+    size_t      upload_limit_rate;          // upload限速
+    size_t      copy_limit_rate;            // copy限速
     ngx_path_t  *dav_client_body_temp_path;
 } ngx_http_dav_loc_conf_t;
 
@@ -43,6 +86,22 @@ struct ngx_http_dav_ctx_s;
 
 typedef ngx_int_t (*ngx_http_request_body_data_handler_pt)
         (ngx_http_request_t *, struct ngx_http_dav_ctx_s*, u_char *, size_t);
+
+typedef struct ngx_http_dav_copy_queue_node_s {
+    ngx_queue_t node;                               // 目录队列节点
+    ngx_dir_t *src_dir;                             // 目录打开后的指针
+    ngx_str_t src_dir_path;                         // 这里存相对路径如：a/b/c
+}ngx_http_dav_copy_queue_node_t;
+
+typedef struct ngx_http_dav_copy_s {
+    ngx_file_t *src_file;                           // 正在复制的源文件
+    ngx_file_t *dst_file;                           // 正在复制的目的文件
+    char       *buf;                                // 每次复制所用的缓冲区
+    size_t      limit_rate;                         // 复制的速率
+    ssize_t     copied_bytes;                       // 已经复制的字节数
+    ngx_event_t event;                              // 定时器事件
+    ngx_http_dav_copy_queue_node_t *dirs_queue;     // 需要复制的目录队列，记得初始化！
+}ngx_http_dav_copy_t;
 
 // 请求的上下文，每个请求一份
 typedef struct ngx_http_dav_ctx_s{
@@ -57,8 +116,10 @@ typedef struct ngx_http_dav_ctx_s{
     ngx_http_request_body_data_handler_pt data_handler;             // 限速的时候处理数据
     ngx_chain_t *to_write;
     ngx_uint_t use_temp_file;               // 是否使用了临时文件
-    ngx_file_t file;                        // 用于保存要操作的文件信息（当前用于PUT）
-    ngx_file_t dst_file;                    // 目标文件
+    ngx_file_t file;                        // 用于保存要操作的文件信息（PUT、COPY使用）
+    ngx_file_t dst_file;                    // 目标文件，用于（PUT、COPY使用）
+    ngx_http_dav_copy_t *copy;
+    ngx_http_request_t *r;
 } ngx_http_dav_ctx_t;
 
 static ngx_int_t ngx_http_dav_handler(ngx_http_request_t *r);
@@ -96,6 +157,10 @@ static void *ngx_http_dav_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_dav_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
 //static ngx_int_t ngx_http_dav_init(ngx_conf_t *cf);
+
+static ngx_int_t ngx_http_dav_pfree(ngx_log_t *log, ngx_pool_t *pool, void *p);
+
+static ngx_int_t ngx_http_dav_close(ngx_log_t *log, ngx_fd_t *pfd);
 
 /**
  * 子请求返回后的处理方法
@@ -154,8 +219,9 @@ static ngx_str_t off_to_ngx_str(ngx_http_request_t *r, off_t num);
  * @param str
  * @return 新分配的字符串
  */
-static ngx_str_t ngx_str_generator(ngx_pool_t *pool, const char *str);
+static ngx_str_t ngx_str_generator(ngx_log_t *log, ngx_pool_t *pool, const char *str);
 
+static void ngx_str_destroyer(ngx_log_t *log, ngx_pool_t *pool, ngx_str_t *str);
 
 /**
  * 获取destination，排除host部分，注意这个函数只是返回一个指针，里面的内容不能改！
@@ -335,6 +401,77 @@ static ngx_int_t ngx_http_dav_create_and_open_temp_file(ngx_http_request_t *r, n
  */
 static ngx_int_t ngx_http_dav_move_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx);
 
+static ngx_int_t ngx_http_dav_file_info_clean(ngx_http_request_t *r, ngx_file_t **pfile);
+
+static ngx_file_t *ngx_http_dav_fill_file_info(
+    ngx_http_request_t *r,
+    u_char *filename,
+    ngx_int_t mode,
+    ngx_int_t create,
+    ngx_uint_t access);
+
+static ngx_int_t ngx_http_dav_copy_ctx_src_dst_file_set(
+    ngx_http_request_t *r,
+    ngx_http_dav_ctx_t *ctx,
+    u_char *src_path,
+    u_char *dst_path);
+
+static ngx_int_t ngx_http_dav_copy_by_fd(
+    ngx_http_request_t *r,
+    ngx_fd_t from_fd,
+    ngx_fd_t to_fd,
+    char *buf,
+    size_t len);
+
+static void ngx_http_dav_copy_file_event_handler(ngx_event_t *ev);
+
+static ngx_http_dav_copy_queue_node_t *ngx_http_dav_first_copy_dir_node_get(
+    ngx_http_request_t *r,
+    ngx_http_dav_ctx_t *ctx);
+
+static ngx_int_t ngx_http_dav_first_copy_dir_node_open(
+    ngx_http_request_t *r,
+    ngx_str_t *base_path,
+    ngx_str_t *ext_path,
+    ngx_http_dav_copy_queue_node_t *first_dir_node);
+
+static ngx_int_t ngx_http_dav_first_copy_dir_node_close(
+    ngx_http_request_t *r,
+    ngx_http_dav_copy_queue_node_t *first_dir_node);
+
+static void ngx_http_dav_first_copy_dir_node_del(
+    ngx_http_dav_copy_queue_node_t *first_dir_node);
+
+static ngx_int_t ngx_http_dav_is_ignore_file(ngx_dir_t *dir);
+
+static ngx_int_t ngx_http_dav_path_merge(
+    ngx_str_t *output_path,
+    ngx_http_request_t *r,
+    ngx_str_t *base_path,
+    ngx_str_t *relative_path,
+    ngx_str_t *ext_path);
+
+static void ngx_http_dav_copy_dir_event_handler(ngx_event_t *ev);
+
+static ngx_http_dav_copy_queue_node_t *ngx_http_dav_copy_dirs_queue_node_new(
+    ngx_http_request_t *r,
+    ngx_dir_t *dir,
+    ngx_str_t *dir_path);
+
+static void ngx_http_dav_copy_dirs_queue_node_free(
+    ngx_http_request_t *r,
+    ngx_http_dav_copy_queue_node_t **pnode);
+
+static ngx_int_t ngx_http_dav_copy_dirs_queue_init(
+    ngx_http_request_t *r,
+    ngx_http_dav_ctx_t *ctx);
+
+static ngx_int_t ngx_http_dav_copy_dir_or_file(
+    ngx_http_request_t *r,
+    ngx_str_t *from,
+    ngx_str_t *to,
+    ngx_file_info_t *from_fi);
+
 static ngx_conf_bitmask_t  ngx_http_dav_methods_mask[] = {
     //{ ngx_string("off"), NGX_HTTP_DAV_OFF },
     { ngx_string("get"), NGX_HTTP_GET},
@@ -407,6 +544,13 @@ static ngx_command_t  ngx_http_dav_commands[] = {
       offsetof(ngx_http_dav_loc_conf_t, dav_client_body_temp_path),
       NULL },
 
+    { ngx_string("dav_copy_limit_rate"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_dav_loc_conf_t, copy_limit_rate),
+      NULL },
+
       ngx_null_command
 };
 
@@ -440,6 +584,32 @@ ngx_module_t  ngx_http_dav_module = {
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
+
+static ngx_int_t
+ngx_http_dav_pfree(ngx_log_t *log, ngx_pool_t *pool, void *p)
+{
+    dav_released_mem_log_debug(log, p);
+    return ngx_pfree(pool, p);
+}
+
+static ngx_int_t
+ngx_http_dav_close(ngx_log_t *log, ngx_fd_t *pfd)
+{
+    ngx_fd_t fd = *pfd;
+
+    if (fd != NGX_INVALID_FILE) {
+        if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                    "dav: " ngx_close_file_n " \"%d\" failed", fd);
+            return NGX_ERROR;
+        }
+
+        dav_closed_fd_log_debug(log, fd);
+        *pfd = NGX_INVALID_FILE;
+    }
+
+    return NGX_OK;
+}
 
 static ngx_str_t
 ngx_str_copy_from_str(ngx_pool_t *pool, const char *src, ngx_int_t len)
@@ -702,6 +872,8 @@ ngx_http_dav_replace_uri_dst(ngx_http_request_t *r, ngx_http_dav_ctx_t *resp_ctx
             {
                 return NGX_ERROR;
             }
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "dav: replaced: %V => %V", &r->uri, &resp_ctx->dst);
             r->uri = resp_ctx->dst;
             //r->unparsed_uri = r->uri;           //
             break;
@@ -712,6 +884,12 @@ ngx_http_dav_replace_uri_dst(ngx_http_request_t *r, ngx_http_dav_ctx_t *resp_ctx
             {
                 return NGX_ERROR;
             }
+
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "dav: replaced: %V => %V", &r->uri, &resp_ctx->src);
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "dav: replaced: %V => %V",
+                    &r->headers_in.destination->value, &resp_ctx->dst);
 
             r->uri = resp_ctx->src;
             //r->unparsed_uri = r->uri;           //
@@ -858,7 +1036,35 @@ ngx_http_dav_check_error(ngx_http_request_t *r, const char *str, ngx_int_t len)
 static void
 ngx_http_dav_shutdown_ctx(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
 {
-    // 这里做一些清理工作，当前什么也不需要做
+    // 如果是临时文件，貌似nginx自己管理了；
+    // 对于wrc10，如果这里直接关闭，然后nginx又关闭，会报错。
+    if (!ctx->use_temp_file) {
+        ngx_http_dav_close(r->connection->log, &ctx->file.fd);
+    }
+
+    ngx_http_dav_close(r->connection->log, &ctx->dst_file.fd);
+
+    if (!ctx->copy || !ctx->copy->src_file || !ctx->copy->dst_file) {
+        return;
+    }
+
+    ngx_http_dav_close(r->connection->log, &ctx->copy->src_file->fd);
+    ngx_http_dav_close(r->connection->log, &ctx->copy->dst_file->fd);
+
+    if (ctx->copy && ctx->copy->src_file) {
+        ngx_http_dav_pfree(r->connection->log, r->pool, ctx->copy->src_file);
+        ctx->copy->src_file = NULL;
+    }
+
+    if (ctx->copy && ctx->copy->dst_file) {
+        ngx_http_dav_pfree(r->connection->log, r->pool, ctx->copy->dst_file);
+        ctx->copy->dst_file = NULL;
+    }
+
+    if (ctx->copy) {
+        ngx_http_dav_pfree(r->connection->log, r->pool, ctx->copy);
+        ctx->copy = NULL;
+    }
 }
 
 static ngx_int_t
@@ -1131,19 +1337,20 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
     r->main->count++;
 #endif
     if (r->request_body || r->discard_body) {
+        ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
         return NGX_OK;
     }
 
     rb = ngx_pcalloc(r->pool, sizeof(ngx_http_request_body_t));
     if (rb == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
         return NGX_OK;
     }
 
     r->request_body = rb;
 
     if (r->headers_in.content_length_n < 0) {
-        ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
+        ctx->response_status = NGX_HTTP_BAD_REQUEST;
         return NGX_OK;
     }
 
@@ -1167,7 +1374,7 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
         b = ngx_calloc_buf(r->pool);
         if (b == NULL) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
             return NGX_OK;
         }
 
@@ -1179,7 +1386,7 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
         rb->bufs = ngx_alloc_chain_link(r->pool);
         if (rb->bufs == NULL) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
             return NGX_OK;
         }
 
@@ -1197,12 +1404,14 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
             // 处理请求体，当前是写到文件
             if (ngx_http_dav_process_request_body(r, rb->bufs) != NGX_OK) {
-                ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
                 return NGX_OK;
             }
 
+            ngx_http_dav_shutdown_ctx(r, ctx);
+            ngx_http_dav_move_file(r, ctx);
             // 处理完了，发送响应
-            ngx_http_dav_send_response_handler(r, ctx);
+            //ngx_http_dav_send_response_handler(r, ctx);
             return NGX_OK;
         }
 
@@ -1226,7 +1435,7 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
             // 设置好读回调，然后进行读
             r->read_event_handler = ngx_http_dav_read_client_request_body_handler;
             ngx_http_dav_do_read_client_request_body(r);
-            return NGX_OK;
+            return NGX_DONE;
         }
 
         next = &rb->bufs->next;
@@ -1258,13 +1467,13 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
 
     rb->buf = ngx_create_temp_buf(r->pool, size);
     if (rb->buf == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
         return NGX_OK;
     }
 
     cl = ngx_alloc_chain_link(r->pool);
     if (cl == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
         return NGX_OK;
     }
 
@@ -1286,7 +1495,7 @@ ngx_http_dav_read_client_request_body(ngx_http_request_t *r)
     r->read_event_handler = ngx_http_dav_read_client_request_body_handler;
 
     ngx_http_dav_do_read_client_request_body(r);
-    return NGX_OK;
+    return NGX_DONE;
 }
 
 
@@ -1334,7 +1543,7 @@ ngx_http_dav_subrequest_post_handler(ngx_http_request_t *r, void *data, ngx_int_
                   "dav: subrequest response body status type = %d", status_json->type);
 
     if (status_json->type != NX_JSON_INTEGER
-        || status_json->int_value != 0
+        //|| status_json->int_value != 0            // 不限制status
         || data_json->type == NX_JSON_NULL)
     {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -1387,8 +1596,14 @@ ngx_http_dav_subrequest_post_handler(ngx_http_request_t *r, void *data, ngx_int_
 
             // NOT HTTP_V2
             rc = ngx_http_dav_read_client_request_body(pr);
-            if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-                return rc;
+            if (rc != NGX_DONE) {
+                ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                              "dav: put 0 byte file or error occured, status = %d",
+                              resp_ctx->response_status);
+
+                pr->headers_out.status = resp_ctx->response_status;
+                pr->write_event_handler = ngx_http_dav_post_handler;
+                return NGX_OK;
             }
 
             return NGX_DONE;
@@ -1420,20 +1635,25 @@ ngx_http_dav_post_handler(ngx_http_request_t *r)
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "in parent request(method = %d): subrequest status = %d", r->method, rc);
 
-    if (r->method != NGX_HTTP_PROPFIND)
+    if (r->method != NGX_HTTP_PROPFIND && r->method != NGX_HTTP_PUT)
     {
         r->main->count++;
     }
 
-    if (rc != NGX_HTTP_OK && rc != NGX_OK)
+    if (rc >= NGX_HTTP_SPECIAL_RESPONSE)
     {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,"subrequest return an error!");
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "subrequest return an error!");
         ngx_http_finalize_request(r, rc);
         return;
     }
 
     // get 放回父请求，因为子请求无法处理
     switch (r->method) {
+        case NGX_HTTP_PROPFIND:
+        {
+            rc = ngx_http_dav_propfind_handler(r);
+            break;
+        }
         case NGX_HTTP_GET:
         {
             rc = ngx_http_dav_get_head_handler(r);
@@ -1459,6 +1679,9 @@ ngx_http_dav_post_handler(ngx_http_request_t *r)
         case NGX_HTTP_COPY:
         {
             rc = ngx_http_dav_copy_move_handler(r);
+            if (rc == NGX_HTTP_DAV_WAIT) {
+                return;
+            }
             break;
         }
         case NGX_HTTP_MOVE:
@@ -1471,9 +1694,8 @@ ngx_http_dav_post_handler(ngx_http_request_t *r)
             rc = ngx_http_dav_options_handler(r);
             break;
         }
-        case NGX_HTTP_PROPFIND:
+        case NGX_HTTP_PUT:
         {
-            rc = ngx_http_dav_propfind_handler(r);
             break;
         }
     }
@@ -1606,20 +1828,32 @@ subrequest_args_generate(ngx_http_request_t *r,
     return args;
 }
 
-static ngx_str_t ngx_str_generator(ngx_pool_t *pool, const char *str)
+static ngx_str_t ngx_str_generator(ngx_log_t *log, ngx_pool_t *pool, const char *str)
 {
     ngx_str_t res = ngx_null_string;
 
-    ngx_int_t len = strlen(str);
+    ngx_int_t len = strlen(str) + 1;
     res.data = ngx_palloc(pool, len);
     if (!res.data)
     {
         return res;
     }
+    //dav_allocated_mem_log_debug(log, res.data);
 
-    res.len = len;
+    res.len = len - 1;
     ngx_memcpy(res.data, str, res.len);
+    res.data[res.len] = '\0';
     return res;
+}
+
+static void ngx_str_destroyer(ngx_log_t *log, ngx_pool_t *pool, ngx_str_t *str)
+{
+    if (str && str->data && str->len > 0) {
+        dav_released_mem_log_debug(log, str->data);
+        ngx_pfree(pool, str->data);
+        str->data = NULL;
+        str->len = 0;
+    }
 }
 
 static ngx_str_t ngx_http_dav_string_splice(ngx_pool_t *pool, ngx_str_t *str1,
@@ -1706,6 +1940,7 @@ ngx_http_dav_handler(ngx_http_request_t *r)
         ngx_memzero(resp_ctx, sizeof(ngx_http_dav_ctx_t));
         resp_ctx->upload_limit_rate = dlcf->upload_limit_rate;
         resp_ctx->file.fd = NGX_INVALID_FILE;
+        resp_ctx->dst_file.fd = NGX_INVALID_FILE;
         resp_ctx->response_status = NGX_HTTP_OK;
 
         if (dlcf && dlcf->dav_client_body_temp_path
@@ -1745,17 +1980,17 @@ ngx_http_dav_handler(ngx_http_request_t *r)
     switch (r->method) {
         case NGX_HTTP_GET:
         {
-            sub_method = ngx_str_generator(r->pool, "get");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "get");
             break;
         }
         case NGX_HTTP_HEAD:
         {
-            sub_method = ngx_str_generator(r->pool, "head");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "head");
             break;
         }
         case NGX_HTTP_OPTIONS:
         {
-            sub_method = ngx_str_generator(r->pool, "options");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "options");
             break;
         }
         case NGX_HTTP_PUT:
@@ -1766,12 +2001,12 @@ ngx_http_dav_handler(ngx_http_request_t *r)
                               "cannot PUT to a collection");
                 return NGX_HTTP_CONFLICT;
             }
-            sub_method = ngx_str_generator(r->pool, "put");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "put");
             break;
         }
         case NGX_HTTP_DELETE:
         {
-            sub_method = ngx_str_generator(r->pool, "delete");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "delete");
             break;
         }
         case NGX_HTTP_MKCOL:
@@ -1782,12 +2017,12 @@ ngx_http_dav_handler(ngx_http_request_t *r)
                               "cannot MKCOL non-collection");
                 return NGX_HTTP_CONFLICT;
             }
-            sub_method = ngx_str_generator(r->pool, "mkcol");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "mkcol");
             break;
         }
         case NGX_HTTP_COPY:
         {
-            sub_method = ngx_str_generator(r->pool, "copy");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "copy");
             if (destination_uri_string_get(r, &sub_dst) != NGX_OK) {
                 return NGX_HTTP_BAD_REQUEST;
             }
@@ -1796,7 +2031,7 @@ ngx_http_dav_handler(ngx_http_request_t *r)
         }
         case NGX_HTTP_MOVE:
         {
-            sub_method = ngx_str_generator(r->pool, "move");
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "move");
             if (destination_uri_string_get(r, &sub_dst) != NGX_OK) {
                 return NGX_HTTP_BAD_REQUEST;
             }
@@ -1805,36 +2040,31 @@ ngx_http_dav_handler(ngx_http_request_t *r)
         }
         case NGX_HTTP_PROPFIND:
         {
-            sub_method = ngx_str_generator(r->pool, "propfind");
-            // propfind 作特殊处理
-            ngx_str_t sub_args = subrequest_args_generate(r, &sub_method, &sub_src, &sub_dst);
-            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                          "PROPFIND subrequest: uri = %V, args = %V, before replace.",
-                          &sub_uri, &sub_args);
-
-            // 保存到上下文中
-            resp_ctx->sub_req_args = sub_args;
-            //r->request_body_in_single_buf = 1;              // 放到1块buf里面，好读
-            rc = ngx_http_read_client_request_body(r, ngx_http_dav_propfind_subreq_handler);
-            if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-                return rc;
-            }
-            return NGX_DONE;
+            sub_method = ngx_str_generator(r->connection->log, r->pool, "propfind");
+            break;
         }
     }
 
     ngx_str_t sub_args = subrequest_args_generate(r, &sub_method, &sub_src, &sub_dst);
+
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                  "COMMON subrequest: uri = %V, args = %V, before replace.",
+                  "subrequest: uri = %V, args = %V.",
                   &sub_uri, &sub_args);
 
     // 保存到上下文中
     resp_ctx->sub_req_args = sub_args;
 
-    rc = ngx_http_dav_subrequest_create(r, &sub_uri, &sub_args,
-            ngx_http_dav_subrequest_post_handler, NULL);
-    if (rc != NGX_OK) {
-        return NGX_DECLINED;
+    if (r->method == NGX_HTTP_PROPFIND) {
+        rc = ngx_http_read_client_request_body(r, ngx_http_dav_propfind_subreq_handler);
+        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+            return rc;
+        }
+    } else {
+        rc = ngx_http_dav_subrequest_create(r, &sub_uri, &sub_args,
+                ngx_http_dav_subrequest_post_handler, NULL);
+        if (rc != NGX_OK) {
+            return NGX_DECLINED;
+        }
     }
 
     // 如果是OK，就证明子请求已经创建, 接下来一定要返回NGX_DONE
@@ -1959,7 +2189,7 @@ static void ngx_http_dav_propfind_subreq_handler(ngx_http_request_t *r)
     }
 }
 
-static ngx_int_t 
+static ngx_int_t
 ngx_http_dav_map_dst_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
 {
     size_t root = 0;
@@ -2006,6 +2236,7 @@ ngx_http_dav_create_and_open_temp_file(ngx_http_request_t *r, struct ngx_http_da
         return NGX_ERROR;
     }
 
+    // 这里创建并打开文件了
     if (ngx_create_temp_file(&ctx->file, path, r->pool, 1, 1, NGX_FILE_DEFAULT_ACCESS) != NGX_OK)
     {
 
@@ -2048,7 +2279,7 @@ ngx_http_dav_write_dst_file(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx, u_ch
             return res;
         }
 
-        // 使用临时文件
+        // 使用临时文件并且文件长度不为0，为0，就直接写了
         if (ctx->use_temp_file) {
             res = ngx_http_dav_create_and_open_temp_file(r, ctx);
             if (res != NGX_OK) {
@@ -2117,6 +2348,7 @@ ngx_http_dav_send_response_handler(ngx_http_request_t *r, ngx_http_dav_ctx_t *ct
     r->headers_out.status = status;
     r->header_only = 1;
 
+    // 临时文件会在这个里面关闭一次
     ngx_http_finalize_request(r, ngx_http_send_header(r));
 }
 
@@ -2459,7 +2691,6 @@ ngx_http_dav_options_handler(ngx_http_request_t *r)
     ngx_str_set(&h->key, "Allow");
     h->value.len = resp_ctx->data.len;
     h->value.data = resp_ctx->data.data;
-    //ngx_str_set(&h->value, "GET,HEAD,PUT,DELETE,MKCOL,COPY,MOVE,PROPFIND,OPTIONS");
     h->hash = 1;
 
     r->headers_out.status = NGX_HTTP_OK;
@@ -2559,12 +2790,15 @@ ngx_http_dav_copy_move_handler(ngx_http_request_t *r)
         return NGX_HTTP_NO_CONTENT;
     }
 
+    /*
+    // 子请求返回的是解析后的，这里就不用再解析了。fix bug: 18735
     if (ngx_http_parse_unsafe_uri(r, &duri, &args, &flags) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "client sent invalid \"Destination\" header: \"%V\"",
                       &dest->value);
         return NGX_HTTP_BAD_REQUEST;
     }
+     */
 
     if ((r->uri.data[r->uri.len - 1] == '/' && *(last - 1) != '/')
         || (r->uri.data[r->uri.len - 1] != '/' && *(last - 1) == '/'))
@@ -2627,16 +2861,16 @@ overwrite_done:
     }
 
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http copy/move from: \"%s\"", path.data);
+                   "http copy/move from: \"%s\", overwrite = %d", path.data, overwrite);
 
     uri = r->uri;
-    r->uri = duri;
+    r->uri = duri;          // 替换
 
     if (ngx_http_map_uri_to_path(r, &copy.path, &root, 0) == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    r->uri = uri;
+    r->uri = uri;           // 恢复
 
     copy.path.len--;  /* omit "\0" */
 
@@ -2649,9 +2883,10 @@ overwrite_done:
         slash = 0;
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http copy to: \"%s\"", copy.path.data);
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "dav: http copy to: \"%s\"", copy.path.data);
 
+    // 目标文件不存在
     if (ngx_link_info(copy.path.data, &fi) == NGX_FILE_ERROR) {
         err = ngx_errno;
 
@@ -2669,6 +2904,7 @@ overwrite_done:
     } else {
 
         /* destination exists */
+        // 目标文件已经存在
 
         if (ngx_is_dir(&fi) && !slash) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -2684,6 +2920,16 @@ overwrite_done:
         }
 
         dir = ngx_is_dir(&fi);
+        if (overwrite) {
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "dav: http delete: \"%s\"", copy.path.data);
+
+            rc = ngx_http_dav_delete_path(r, &copy.path, dir);
+
+            if (rc != NGX_OK) {
+                return rc;
+            }
+        }
     }
 
     if (ngx_link_info(path.data, &fi) == NGX_FILE_ERROR) {
@@ -2699,10 +2945,11 @@ overwrite_done:
                           "\"%V\" is collection", &r->uri);
             return NGX_HTTP_BAD_REQUEST;
         }
-
+        /*
+        //原版，暂且保留
         if (overwrite) {
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "http delete: \"%s\"", copy.path.data);
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "dav: http delete: \"%s\"", copy.path.data);
 
             rc = ngx_http_dav_delete_path(r, &copy.path, dir);
 
@@ -2710,56 +2957,72 @@ overwrite_done:
                 return rc;
             }
         }
+        */
     }
 
+    dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
     if (ngx_is_dir(&fi)) {
 
         path.len -= 2;  /* omit "/\0" */
 
+        // 移动
         if (r->method == NGX_HTTP_MOVE) {
             if (ngx_rename_file(path.data, copy.path.data) != NGX_FILE_ERROR) {
                 return NGX_HTTP_CREATED;
             }
         }
 
-        if (ngx_create_dir(copy.path.data, ngx_file_access(&fi))
-            == NGX_FILE_ERROR)
-        {
-            return ngx_http_dav_error(r->connection->log, ngx_errno,
-                                      NGX_HTTP_NOT_FOUND,
-                                      ngx_create_dir_n, copy.path.data);
-        }
-
-        copy.len = path.len;
-
-        tree.init_handler = NULL;
-        tree.file_handler = ngx_http_dav_copy_tree_file;
-        tree.pre_tree_handler = ngx_http_dav_copy_dir;
-        tree.post_tree_handler = ngx_http_dav_copy_dir_time;
-        tree.spec_handler = ngx_http_dav_noop;
-        tree.data = &copy;
-        tree.alloc = 0;
-        tree.log = r->connection->log;
-
-        if (ngx_walk_tree(&tree, &path) == NGX_OK) {
-
-            if (r->method == NGX_HTTP_MOVE) {
-                rc = ngx_http_dav_delete_path(r, &path, 1);
-
-                if (rc != NGX_OK) {
-                    return rc;
-                }
+        // <= 0意味着没有设置限速
+        if (dlcf->copy_limit_rate <= 0 || r->method == NGX_HTTP_MOVE) {
+            // 以下是COPY 或者 MOVE时存在同名文件夹
+            if (ngx_create_dir(copy.path.data, ngx_file_access(&fi))
+                == NGX_FILE_ERROR)
+            {
+                return ngx_http_dav_error(r->connection->log, ngx_errno,
+                                        NGX_HTTP_NOT_FOUND,
+                                        ngx_create_dir_n, copy.path.data);
             }
 
-            return NGX_HTTP_CREATED;
+            copy.len = path.len;
+
+            tree.init_handler = NULL;
+            tree.file_handler = ngx_http_dav_copy_tree_file;
+            tree.pre_tree_handler = ngx_http_dav_copy_dir;
+            tree.post_tree_handler = ngx_http_dav_copy_dir_time;
+            tree.spec_handler = ngx_http_dav_noop;
+            tree.data = &copy;
+            tree.alloc = 0;
+            tree.log = r->connection->log;
+
+            if (ngx_walk_tree(&tree, &path) == NGX_OK) {
+
+                if (r->method == NGX_HTTP_MOVE) {
+                    rc = ngx_http_dav_delete_path(r, &path, 1);
+
+                    if (rc != NGX_OK) {
+                        return rc;
+                    }
+                }
+
+                return NGX_HTTP_CREATED;
+            }
+
+        } else {
+            // 两个操作是因为上面的操作删多了，这里加回来
+            if (slash == 1) {
+                copy.path.data[copy.path.len] = '/';
+                copy.path.len++;
+                copy.path.data[copy.path.len] = '\0';
+            }
+            path.len++;
+            if (ngx_http_dav_copy_dir_or_file(r, &path, &copy.path, &fi) == NGX_OK) {
+                return NGX_HTTP_DAV_WAIT;
+            }
         }
 
     } else {
 
         if (r->method == NGX_HTTP_MOVE) {
-
-            dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
-
             ext.access = 0;
             ext.path_access = dlcf->access;
             ext.time = -1;
@@ -2774,20 +3037,787 @@ overwrite_done:
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
-        cf.size = ngx_file_size(&fi);
-        cf.buf_size = 0;
-        cf.access = ngx_file_access(&fi);
-        cf.time = ngx_file_mtime(&fi);
-        cf.log = r->connection->log;
+        // <= 0意味着没有设置限速
+        if (dlcf->copy_limit_rate <= 0 || r->method == NGX_HTTP_MOVE) {
+            cf.size = ngx_file_size(&fi);
+            cf.buf_size = 0;
+            cf.access = ngx_file_access(&fi);
+            cf.time = ngx_file_mtime(&fi);
+            cf.log = r->connection->log;
 
-        if (ngx_copy_file(path.data, copy.path.data, &cf) == NGX_OK) {
-            return NGX_HTTP_NO_CONTENT;
+            if (ngx_copy_file(path.data, copy.path.data, &cf) == NGX_OK) {
+                return NGX_HTTP_NO_CONTENT;
+            }
+        } else
+        {
+            if (ngx_http_dav_copy_dir_or_file(r, &path, &copy.path, &fi) == NGX_OK) {
+                return NGX_HTTP_DAV_WAIT;
+            }
         }
     }
 
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
 }
 
+static ngx_int_t
+ngx_http_dav_file_info_clean(ngx_http_request_t *r, ngx_file_t **pfile)
+{
+    ngx_file_t *file = *pfile;
+    if (!file || (file->fd != NGX_INVALID_FILE && ngx_close_file(file->fd) == NGX_FILE_ERROR)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            ngx_close_file_n " \"%d\" failed", file->fd);
+        return NGX_ERROR;
+    }
+    dav_closed_fd_log_debug(r->connection->log, file->fd);
+
+    file->fd = NGX_INVALID_FILE;
+    ngx_str_destroyer(r->connection->log, r->pool, &file->name);
+    ngx_http_dav_pfree(r->connection->log, r->pool, file);
+    *pfile = NULL;
+
+    return NGX_OK;
+}
+
+static ngx_file_t *
+ngx_http_dav_fill_file_info(ngx_http_request_t *r,
+    u_char *filename, ngx_int_t mode, ngx_int_t create, ngx_uint_t access)
+{
+    ngx_file_t *file = NULL;
+
+    file = ngx_palloc(r->pool, sizeof(ngx_file_t));
+    if (!file) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            "dav: alloc memory failed: %s", filename);
+        return NULL;
+    }
+    dav_allocated_mem_log_debug(r->connection->log, file, NGX_HTTP_DAV_NEED_RELEASE);
+
+    file->fd = ngx_open_file(filename, mode, create, access);
+    if (file->fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: " ngx_open_file_n " \"%s\" failed", filename);
+        return NULL;
+    }
+    dav_opened_fd_log_debug(r->connection->log, file->fd);
+
+    file->name.data = filename;
+    file->name.len = ngx_strlen(filename);
+
+    if (ngx_fd_info(file->fd, &file->info) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
+                        ngx_fd_info_n " \"%s\" failed", filename);
+        if (ngx_close_file(file->fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                          ngx_close_file_n " \"%s\" failed", filename);
+        }
+        return NULL;
+    }
+
+    return file;
+}
+
+static ngx_int_t
+ngx_http_dav_copy_ctx_src_dst_file_set(
+    ngx_http_request_t *r,
+    ngx_http_dav_ctx_t *ctx,
+    u_char *src_path,
+    u_char *dst_path)
+{
+    ngx_http_dav_copy_t *copy = ctx->copy;
+
+    // 清除上一次的信息，填充当前源文件的信息
+    if (copy->src_file && ngx_http_dav_file_info_clean(r, &copy->src_file) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: clean dst file info failed");
+        return NGX_ERROR;
+    }
+
+    copy->src_file = ngx_http_dav_fill_file_info(r, src_path,
+        NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+
+    if (!copy->src_file) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: fill copy file info failed");
+        return NGX_ERROR;
+    }
+
+    // 清除上一次的信息，并填充当前目标文件的信息
+    if (copy->dst_file && ngx_http_dav_file_info_clean(r, &copy->dst_file) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: clean dst file info failed");
+        return NGX_ERROR;
+    }
+
+    copy->dst_file = ngx_http_dav_fill_file_info(r, dst_path, NGX_FILE_WRONLY,
+        NGX_FILE_CREATE_OR_OPEN, ngx_file_access(&copy->src_file->info));
+
+    if (!copy->dst_file) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: fill copy file info failed");
+        return NGX_ERROR;
+    }
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: copy file: %s -> %s", copy->src_file->name.data, copy->dst_file->name.data);
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_copy_by_fd(ngx_http_request_t *r,
+    ngx_fd_t from_fd, ngx_fd_t to_fd, char *buf, size_t len)
+{
+    ssize_t           n;
+
+    if (len == 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "dav: copy len is 0!");
+        return NGX_ERROR;
+    }
+
+    n = ngx_read_fd(from_fd, buf, len);
+
+    if (n == -1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                        ngx_read_fd_n " \"%d\" failed", from_fd);
+        return NGX_ERROR;
+    }
+
+    if ((size_t) n != len) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        ngx_read_fd_n " has read only %z of %d from %d",
+                        n, len, from_fd);
+        return NGX_ERROR;
+    }
+
+    n = ngx_write_fd(to_fd, buf, len);
+
+    if (n == -1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                        ngx_write_fd_n " \"%d\" failed", to_fd);
+        return NGX_ERROR;
+    }
+
+    if ((size_t) n != len) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        ngx_write_fd_n " has written only %z of %d to %d",
+                        n, len, to_fd);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_dav_copy_file_event_handler(ngx_event_t *ev)
+{
+    off_t             size;
+    size_t            copy_len;
+    ngx_http_dav_ctx_t *ctx = (void *)ev->data;
+    ngx_http_request_t *r = ctx->r;
+    ngx_msec_t         delay;
+    ngx_http_dav_copy_t *copy = ctx->copy;
+
+    if (copy->buf == NULL) {
+        copy->buf = ngx_palloc(r->pool, NGX_HTTP_DAV_COPY_THRESHOLD);
+        if (copy->buf == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dav: copy_event: copy by fd failed");
+            goto dav_copy_file_event_finished;
+        }
+        dav_allocated_mem_log_debug(r->connection->log, copy->buf, NGX_HTTP_DAV_NONEED_RELEASE);
+    }
+
+    size = ngx_file_size(&copy->src_file->info);
+    copy_len = size - copy->copied_bytes;  // 剩下
+    copy_len = copy_len <= NGX_HTTP_DAV_COPY_THRESHOLD ? copy_len : NGX_HTTP_DAV_COPY_THRESHOLD;
+    // 进行一次复制
+    if (copy_len > 0) {
+        if (ngx_http_dav_copy_by_fd(r, copy->src_file->fd,
+        copy->dst_file->fd, copy->buf, copy_len) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "dav: copy_event: copy by fd failed");
+            goto dav_copy_file_event_finished;
+        }
+        copy->copied_bytes += copy_len;
+    }
+
+    // 此文件还没复制完成
+    if (copy->copied_bytes < size) {
+        if (copy->event.handler != ngx_http_dav_copy_file_event_handler) {
+            copy->event.handler = ngx_http_dav_copy_file_event_handler;
+        }
+        delay = (ngx_msec_t) (copy_len * 1000 / copy->limit_rate + 1);
+        ngx_add_timer(&copy->event, delay);
+    } else {
+        // 此文件复制完成了
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "dav: copy finished: %s -> %s",
+                copy->src_file->name.data, copy->dst_file->name.data);
+        copy->copied_bytes = 0;
+        // 队列不为空，就调用目录处理函数
+        if (copy->dirs_queue && !ngx_queue_empty(&copy->dirs_queue->node)) {
+            copy->event.handler = ngx_http_dav_copy_dir_event_handler;      // 超时后调用目录处理
+            delay = (ngx_msec_t) (copy_len * 1000 / copy->limit_rate + 1);
+            ngx_add_timer(&copy->event, delay);
+            //ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            //                "dav: ngx_add_timer for dir: delay = \"%d\"", delay);
+        } else {
+            // 如果队列为空或者没有队列，就直接返回
+            if (copy->event.timer_set) {
+                ngx_del_timer(&copy->event);
+            }
+            ctx->response_status = NGX_HTTP_CREATED;
+            goto dav_copy_file_event_finished;
+        }
+    }
+
+    return;
+
+dav_copy_file_event_finished:
+    ngx_http_dav_shutdown_ctx(r, ctx);
+    ngx_http_finalize_request(r, ctx->response_status);
+}
+
+
+static ngx_http_dav_copy_queue_node_t *
+ngx_http_dav_first_copy_dir_node_get(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
+{
+    ngx_http_dav_copy_t *copy = ctx->copy;
+    ngx_http_dav_copy_queue_node_t *first_dir_node;
+    ngx_queue_t *first_queue_node;
+
+    // 队列为空，直接返回请求（清理）
+    if (ngx_queue_empty(&copy->dirs_queue->node)) {
+        ngx_log_debug(NGX_LOG_INFO, r->connection->log, 0, "dav: queue is empty");
+        ctx->response_status = NGX_HTTP_CREATED;
+        return NULL;
+    }
+
+    // 队列非空，取队首元素
+    first_queue_node = ngx_queue_head(&copy->dirs_queue->node);
+    if (!first_queue_node) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: get queue head failed");
+        ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NULL;
+    }
+    first_dir_node = ngx_queue_data(first_queue_node, ngx_http_dav_copy_queue_node_t, node);
+    if (!first_dir_node) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: get queue data failed");
+        ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return NULL;
+    }
+
+    return first_dir_node;
+}
+
+static ngx_int_t
+ngx_http_dav_first_copy_dir_node_open(
+        ngx_http_request_t *r,
+        ngx_str_t *base_path,
+        ngx_str_t *ext_path,
+        ngx_http_dav_copy_queue_node_t *first_dir_node)
+{
+    ngx_str_t src_abs_path;
+
+    // 如果此源目录未打开，则打开，并创建目标目录
+    if (first_dir_node && !first_dir_node->src_dir) {
+
+        first_dir_node->src_dir = ngx_palloc(r->pool, sizeof(ngx_dir_t));
+        if (!first_dir_node->src_dir) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "dav: alloc memory for first src dir failed");
+            return NGX_ERROR;
+        }
+        dav_allocated_mem_log_debug(r->connection->log, first_dir_node->src_dir, NGX_HTTP_DAV_NEED_RELEASE);
+
+        if (ngx_http_dav_path_merge(&src_abs_path, r,
+                base_path, ext_path, NULL)!= NGX_OK) {
+
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dav: first copy dir node open: merge path failed");
+            return NGX_ERROR;
+        }
+
+        if (ngx_open_dir(&src_abs_path, first_dir_node->src_dir) == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                        ngx_open_dir_n " \"%s\" failed", ext_path->data);
+            return NGX_ERROR;
+        }
+        dav_opend_dir_log_debug(r->connection->log, first_dir_node->src_dir);
+
+        ngx_str_destroyer(r->connection->log, r->pool, &src_abs_path);
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_first_copy_dir_node_close(ngx_http_request_t *r, ngx_http_dav_copy_queue_node_t *first_dir_node)
+{
+    if (first_dir_node->src_dir) {
+        if (ngx_close_dir(first_dir_node->src_dir) == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_CRIT, r->connection->log, ngx_errno,
+                ngx_close_dir_n " \"%s\" failed", first_dir_node->src_dir_path.data);
+            return NGX_ERROR;
+        }
+
+        dav_closed_dir_log_debug(r->connection->log, first_dir_node->src_dir);
+
+        ngx_str_destroyer(r->connection->log, r->pool, &first_dir_node->src_dir_path);
+        ngx_http_dav_pfree(r->connection->log, r->pool, first_dir_node->src_dir);
+        first_dir_node->src_dir = NULL;
+    }
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_dav_first_copy_dir_node_del(ngx_http_dav_copy_queue_node_t *first_dir_node)
+{
+    ngx_queue_remove(&first_dir_node->node);
+}
+
+static ngx_int_t
+ngx_http_dav_is_ignore_file(ngx_dir_t *dir)
+{
+    u_char     *name;
+    size_t      len;
+
+    len = ngx_de_namelen(dir);
+    name = ngx_de_name(dir);
+
+    if (len == 1 && name[0] == '.') {
+        return NGX_OK;
+    }
+
+    if (len == 2 && name[0] == '.' && name[1] == '.') {
+        return NGX_OK;
+    }
+
+    return NGX_ERROR;
+}
+
+// 最后是否有下划线由所给的三个path决定
+static ngx_int_t
+ngx_http_dav_path_merge(
+    ngx_str_t *output_path,
+    ngx_http_request_t *r,
+    ngx_str_t *base_path,
+    ngx_str_t *relative_path,
+    ngx_str_t *ext_path)
+{
+    if (!output_path) {
+        return NGX_ERROR;
+    }
+
+    ngx_int_t len = 1;             // for '\0'
+
+    if (base_path && base_path->len > 0) {
+        len += base_path->len;
+    }
+
+    if (relative_path && relative_path->len > 0) {
+        len += relative_path->len;
+    }
+
+    if (ext_path && ext_path->len > 0) {
+        len += ext_path->len;
+    }
+
+    if (len <= 1) {
+        return NGX_ERROR;
+    }
+
+    output_path->data = ngx_palloc(r->pool, len);
+    if (!output_path->data) {
+        return NGX_ERROR;
+    }
+    dav_allocated_mem_log_debug(r->connection->log, output_path->data, NGX_HTTP_DAV_NEED_RELEASE);
+
+    output_path->len = 0;
+    if (base_path && base_path->len > 0) {
+        ngx_memcpy(output_path->data, base_path->data, base_path->len);
+        output_path->len += base_path->len;
+    }
+
+    if (relative_path && relative_path->len > 0) {
+        ngx_memcpy(output_path->data + output_path->len, relative_path->data, relative_path->len);
+        output_path->len += relative_path->len;
+    }
+
+    if (ext_path && ext_path->len > 0) {
+        ngx_memcpy(output_path->data + output_path->len, ext_path->data, ext_path->len);
+        output_path->len += ext_path->len;
+    }
+
+    output_path->data[output_path->len] = '\0';
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_copy_dir_create(
+    ngx_http_request_t *r,
+    ngx_http_dav_ctx_t *ctx,
+    ngx_str_t *src_base_path,
+    ngx_str_t *dst_base_path,
+    ngx_str_t *relative_path)
+{
+    ngx_str_t src_abs_path;
+    ngx_str_t dst_abs_path;
+    ngx_file_info_t fi;
+
+    // 手动释放
+    if (ngx_http_dav_path_merge(&src_abs_path, r,
+            src_base_path, relative_path, NULL)!= NGX_OK) {
+
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: merge path failed");
+        return NGX_ERROR;
+    }
+
+    // 手动释放
+    if (ngx_http_dav_path_merge(&dst_abs_path, r,
+        dst_base_path, relative_path, NULL)!= NGX_OK) {
+
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: merge path failed");
+        return NGX_ERROR;
+    }
+
+    if (ngx_link_info(src_abs_path.data, &fi) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            ngx_link_info_n "dav: link info failed: %s", src_abs_path.data);
+        return NGX_ERROR;
+    }
+
+    if (ngx_create_dir(dst_abs_path.data, ngx_file_access(&fi)) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+            ngx_create_dir_n " \"%s\" failed", dst_abs_path.data);
+        return NGX_ERROR;
+    }
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: create directory: %s", dst_abs_path.data);
+
+    ngx_str_destroyer(r->connection->log, r->pool, &src_abs_path);
+    ngx_str_destroyer(r->connection->log, r->pool, &dst_abs_path);
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_dav_copy_dir_event_handler(ngx_event_t *ev)
+{
+    ngx_dir_t *src_dir;
+    ngx_str_t src_abs_path;
+    ngx_str_t dst_abs_path;
+    ngx_http_dav_ctx_t *ctx = (void *)ev->data;
+    ngx_http_request_t *r = ctx->r;
+    ngx_http_dav_copy_t *copy = ctx->copy;
+    ngx_http_dav_copy_queue_node_t *new_node;
+    ngx_http_dav_copy_queue_node_t *first_dir_node;
+
+    first_dir_node = ngx_http_dav_first_copy_dir_node_get(r, ctx);
+    // finished or error
+    if (!first_dir_node) {
+        goto dav_copy_dir_event_finish;
+    }
+
+    // 此目录还没打开，意味着对应的目标目录还没有创建，进行创建
+    if (!first_dir_node->src_dir) {
+        if (ngx_http_dav_copy_dir_create(r, ctx, &ctx->file.name,
+        &ctx->dst_file.name, &first_dir_node->src_dir_path) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "dav: create dir failed");
+            goto dav_copy_dir_event_finish;
+        }
+
+        if (ngx_http_dav_first_copy_dir_node_open(r, &ctx->file.name, &first_dir_node->src_dir_path, first_dir_node) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "dav: open first dir node failed");
+            goto dav_copy_dir_event_finish;
+        }
+    }
+
+    for ( ;; ) {
+
+        ngx_set_errno(0);
+
+        if (ngx_read_dir(first_dir_node->src_dir) == NGX_ERROR) {
+            // 读完了:
+            //  关闭当前目录,释放内存；
+            //  获取目录队列中下一个节点，如果没有对应的目录，就创建，然后打开，继续读
+            // 没读完：
+            //  是目录：就加入队列；是文件，就进行文件复制
+            if (ngx_errno == NGX_ENOMOREFILES) {
+                if (first_dir_node->src_dir_path.data) {
+                    dav_queue_remove_log_debug(r->connection->log, first_dir_node->src_dir_path.data);
+                }
+
+                if (ngx_http_dav_first_copy_dir_node_close(r, first_dir_node) != NGX_OK) {
+                    goto dav_copy_dir_event_finish;
+                }
+
+                ngx_http_dav_first_copy_dir_node_del(first_dir_node);
+
+                ngx_http_dav_copy_dirs_queue_node_free(r, &first_dir_node);
+
+                // 更新指向首节点的指针
+                first_dir_node = ngx_http_dav_first_copy_dir_node_get(r, ctx);
+                // finished or error
+                if (!first_dir_node) {
+                    goto dav_copy_dir_event_finish;
+                }
+
+                if (ngx_http_dav_copy_dir_create(r, ctx, &ctx->file.name,
+                &ctx->dst_file.name, &first_dir_node->src_dir_path) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "dav: create dir failed");
+                    goto dav_copy_dir_event_finish;
+                }
+
+                if (ngx_http_dav_first_copy_dir_node_open(r, &ctx->file.name,
+                        &first_dir_node->src_dir_path, first_dir_node) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "dav: open first dir node failed");
+                    goto dav_copy_dir_event_finish;
+                }
+
+                // 继续下一次读，此时当前目录已经换了
+                continue;
+            } else {
+                if (first_dir_node->src_dir_path.data) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                            ngx_read_dir_n " \"%s\" failed", first_dir_node->src_dir_path.data);
+                }
+
+                goto dav_copy_dir_event_finish;
+            }
+        }   // error
+
+        // not error
+        // 如果是需要忽略的文件、目录，就忽略
+        if (ngx_http_dav_is_ignore_file(first_dir_node->src_dir) == NGX_OK) {
+            continue;
+        }
+
+        // 是目录就加入到队列，是文件就进行文件操作(直接复制)
+        if (ngx_de_is_file(first_dir_node->src_dir)) {
+            break;
+        } else if (ngx_de_is_dir(first_dir_node->src_dir)) {
+            new_node = ngx_http_dav_copy_dirs_queue_node_new(r, NULL, NULL);
+            if (!new_node) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "dav: get copy dirs new queue node failed");
+                goto dav_copy_dir_event_finish;
+            }
+
+            ngx_str_t rel_str = ngx_str_generator(r->connection->log, r->pool, (const char *)ngx_de_name(first_dir_node->src_dir));
+            ngx_str_t ext_str = ngx_str_generator(r->connection->log, r->pool, "/");
+            dav_allocated_mem_log_debug(r->connection->log, rel_str.data, NGX_HTTP_DAV_NEED_RELEASE);
+            dav_allocated_mem_log_debug(r->connection->log, ext_str.data, NGX_HTTP_DAV_NEED_RELEASE);
+            if (ngx_http_dav_path_merge(&new_node->src_dir_path, r,
+                    &first_dir_node->src_dir_path, &rel_str, &ext_str)!= NGX_OK) {
+
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "dav: merge path failed");
+                goto dav_copy_dir_event_finish;
+            }
+            ngx_str_destroyer(r->connection->log, r->pool, &rel_str);
+            ngx_str_destroyer(r->connection->log, r->pool, &ext_str);
+
+            dav_queue_insert_log_debug(r->connection->log, new_node->src_dir_path.data);
+
+            ngx_queue_insert_tail(&copy->dirs_queue->node, &new_node->node);
+        } else {
+            // 不是文件也不是目录，跳过
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "dav: \"%s\" is not file or directory", first_dir_node->src_dir_path.data);
+            continue;
+        }
+    }
+
+    // 生成源文件和目标文件的绝对路径
+    ngx_str_t filename = ngx_str_generator(r->connection->log, r->pool,
+        (const char *)ngx_de_name(first_dir_node->src_dir));
+    dav_allocated_mem_log_debug(r->connection->log, filename.data, NGX_HTTP_DAV_NEED_RELEASE);
+
+    if (ngx_http_dav_path_merge(&src_abs_path, r,
+            &ctx->file.name, &first_dir_node->src_dir_path, &filename)!= NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: merge src abs path failed");
+        goto dav_copy_dir_event_finish;
+    }
+
+    if (ngx_http_dav_path_merge(&dst_abs_path, r,
+            &ctx->dst_file.name, &first_dir_node->src_dir_path, &filename)!= NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: merge dst abs path failed");
+        goto dav_copy_dir_event_finish;
+    }
+
+    // 打开源文件和目的文件并填充相关信息，这些信息保存在ctx中
+    if (ngx_http_dav_copy_ctx_src_dst_file_set(r, ctx, src_abs_path.data, dst_abs_path.data) != NGX_OK) {
+        goto dav_copy_dir_event_finish;
+    }
+
+    ngx_str_destroyer(r->connection->log, r->pool, &filename);
+
+    // 是文件，调用文件处理函数
+    ngx_http_dav_copy_file_event_handler(ev);
+    return;
+
+dav_copy_dir_event_finish:
+
+    // 这些让nginx自动回收即可
+    ngx_str_destroyer(r->connection->log, r->pool, &filename);
+    ngx_str_destroyer(r->connection->log, r->pool, &src_abs_path);
+    ngx_str_destroyer(r->connection->log, r->pool, &dst_abs_path);
+
+    ngx_http_dav_shutdown_ctx(r, ctx);
+    ngx_http_finalize_request(r, ctx->response_status);
+}
+
+static ngx_http_dav_copy_queue_node_t *
+ngx_http_dav_copy_dirs_queue_node_new(ngx_http_request_t *r, ngx_dir_t *dir, ngx_str_t *dir_path)
+{
+    ngx_http_dav_copy_queue_node_t *new_node;
+
+    // 手动回收
+    new_node = ngx_palloc(r->pool, sizeof(ngx_http_dav_copy_queue_node_t));
+    if (!new_node) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: alloc memory for new node failed");
+        return NULL;
+    }
+    dav_allocated_mem_log_debug(r->connection->log, new_node, NGX_HTTP_DAV_NEED_RELEASE);
+
+    new_node->src_dir = dir;
+    new_node->src_dir_path.data = NULL;
+    new_node->src_dir_path.len = 0;
+    if (dir_path && dir_path->len > 0) {
+        ngx_http_dav_path_merge(&new_node->src_dir_path, r, dir_path, NULL, NULL);
+        if (!new_node->src_dir_path.data || new_node->src_dir_path.len <= 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "dav: copy path to new node failed");
+            return NULL;
+        }
+    }
+
+    return new_node;
+}
+
+static void
+ngx_http_dav_copy_dirs_queue_node_free(ngx_http_request_t *r, ngx_http_dav_copy_queue_node_t **pnode)
+{
+    ngx_http_dav_copy_queue_node_t *node = *pnode;
+    ngx_http_dav_pfree(r->connection->log, r->pool, node);
+    *pnode = NULL;
+}
+
+static ngx_int_t
+ngx_http_dav_copy_dirs_queue_init(ngx_http_request_t *r, ngx_http_dav_ctx_t *ctx)
+{
+    ngx_http_dav_copy_t *copy = ctx->copy;
+
+    // 这里分配的内存，请求结束再自动回收
+    copy->dirs_queue = ngx_palloc(r->pool, sizeof(ngx_http_dav_copy_queue_node_t));
+    if (!copy->dirs_queue) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: alloc memory for dirs_queue failed");
+        return NGX_ERROR;
+    }
+    dav_allocated_mem_log_debug(r->connection->log, copy->dirs_queue, NGX_HTTP_DAV_NONEED_RELEASE);
+
+    // 这个是头结点，什么都不用设置
+    ngx_queue_init(&copy->dirs_queue->node);
+    copy->dirs_queue->src_dir = NULL;
+    copy->dirs_queue->src_dir_path.data = NULL;
+    copy->dirs_queue->src_dir_path.len = 0;
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_copy_dir_or_file(
+    ngx_http_request_t *r,
+    ngx_str_t *from,
+    ngx_str_t *to,
+    ngx_file_info_t *from_fi)
+{
+    ngx_http_dav_ctx_t *ctx = NULL;
+    ngx_http_dav_copy_t *copy = NULL;
+    ngx_http_dav_loc_conf_t  *dlcf = NULL;
+    ngx_http_dav_copy_queue_node_t *new_node;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    if (!ctx) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "dav: get module ctx failed");
+        return NGX_ERROR;
+    }
+
+    if (!ctx->copy) {
+        ctx->copy = ngx_palloc(r->pool, sizeof(ngx_http_dav_copy_t));
+        if (!ctx->copy) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "dav: palloc memory for copy struct failed");
+            return NGX_ERROR;
+        }
+        dav_allocated_mem_log_debug(r->connection->log, ctx->copy, NGX_HTTP_DAV_NONEED_RELEASE);
+    }
+    ngx_memset(ctx->copy, 0, sizeof(ngx_http_dav_copy_t));
+
+    // 这两个是最初的绝对路径，后面不要修改，在进行复制的时候需要用到！
+    ctx->file.name.data = from->data;
+    ctx->file.name.len = from->len;
+    ctx->dst_file.name.data = to->data;
+    ctx->dst_file.name.len = to->len;
+
+    // 后面的操作如果成功，会修改这个变量的值
+    ctx->response_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    ctx->r = r;
+
+    copy = ctx->copy;
+    copy->event.data = (void *)ctx;
+    copy->event.delayed = 1;
+
+    dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
+    copy->limit_rate = dlcf->copy_limit_rate;
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "dav: copy->limit_rate = %d", copy->limit_rate);
+
+    // 如果是目录，就初始化文件夹队列，并把当前文件夹(生成队列节点)添加到队列；
+    // 然后开始目录拷贝操作
+    if (ngx_is_dir(from_fi)) {
+        if (ngx_http_dav_copy_dirs_queue_init(r, ctx) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        new_node = ngx_http_dav_copy_dirs_queue_node_new(r, NULL, NULL); //&ctx->file.name);
+        if (!new_node) {
+            return NGX_ERROR;
+        }
+
+        ngx_queue_insert_tail(&copy->dirs_queue->node, &new_node->node);
+
+        ngx_http_dav_copy_dir_event_handler(&copy->event);
+    } else {
+        // 是文件，直接打开源文件和目的文件并填充相关信息，这些信息保存在ctx中
+        // 然后开始文件拷贝调度
+        copy->event.handler = ngx_http_dav_copy_file_event_handler;
+        if (ngx_http_dav_copy_ctx_src_dst_file_set(r, ctx,
+                ctx->file.name.data, ctx->dst_file.name.data) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                "dav: set copy path failed");
+            return NGX_ERROR;
+        }
+        ngx_http_dav_copy_file_event_handler(&copy->event);
+    }
+
+    return NGX_OK;
+}
 
 static ngx_int_t
 ngx_http_dav_copy_dir(ngx_tree_ctx_t *ctx, ngx_str_t *path)
@@ -3058,6 +4088,7 @@ ngx_http_dav_create_loc_conf(ngx_conf_t *cf)
     conf->subrequest_uri.len = 0;
     conf->subrequest_uri.data = NULL;
     conf->upload_limit_rate = NGX_CONF_UNSET_SIZE;
+    conf->copy_limit_rate = NGX_CONF_UNSET_SIZE;
 
     return conf;
 }
@@ -3083,6 +4114,7 @@ ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->subrequest_uri, prev->subrequest_uri, "");
 
     ngx_conf_merge_size_value(conf->upload_limit_rate, prev->upload_limit_rate, 0);
+    ngx_conf_merge_size_value(conf->copy_limit_rate, prev->copy_limit_rate, 0);
 
     if (ngx_conf_merge_path_value(cf, &conf->dav_client_body_temp_path,
                               prev->dav_client_body_temp_path,
